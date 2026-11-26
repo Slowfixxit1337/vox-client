@@ -22,6 +22,7 @@ use vox_protocol::{
 };
 
 use super::{EXCHANGE_TIMEOUT, Socket, exchange, open};
+use crate::voice;
 
 pub struct Connection {
     socket: Socket,
@@ -31,6 +32,7 @@ pub struct Connection {
     next_request: u64,
     bundled_mid: Option<String>,
     receiver_guard: Option<FrameCryptor>,
+    voice: Option<voice::Session>,
 }
 
 impl Connection {
@@ -38,7 +40,12 @@ impl Connection {
         address: &DevAddress,
         room: RoomJoined,
         tls: Option<Connector>,
+        voice_settings: Option<voice::Settings>,
     ) -> Result<Self> {
+        ensure!(
+            voice_settings.is_none() || room.allowed_tracks.contains(&vox_protocol::Track::Mic),
+            "ticket does not allow a microphone track"
+        );
         let url = address.verified_sfu_url(&room.sfu_url)?;
         let socket = open(url, tls, CAP_FRAME_E2EE | CAP_SFU_TRANSPORT).await?;
         let mut config = RtcConfiguration::default();
@@ -81,8 +88,10 @@ impl Connection {
             next_request: 3,
             bundled_mid: None,
             receiver_guard: None,
+            voice: None,
         };
 
+        let mut voice_settings = voice_settings;
         for (index, kind) in [
             MediaType::Audio,
             MediaType::Video,
@@ -92,6 +101,16 @@ impl Connection {
         .into_iter()
         .enumerate()
         {
+            if index == 0
+                && let Some(settings) = voice_settings.take()
+            {
+                connection.voice = Some(voice::Session::prepare(
+                    &factory,
+                    &connection.peer,
+                    settings,
+                )?);
+                continue;
+            }
             let transceiver = connection.peer.add_transceiver_for_media(
                 kind,
                 RtpTransceiverInit {
@@ -127,10 +146,7 @@ impl Connection {
                 connection.receiver_guard = Some(cryptor);
             }
         }
-        let local = connection
-            .peer
-            .create_offer(OfferOptions::default())
-            .await?;
+        let local = create_offer(&connection.peer).await?;
         let offer = SdpOffer {
             generation,
             sdp: local.to_string(),
@@ -181,6 +197,17 @@ impl Connection {
     }
 
     pub async fn maintain(mut self) -> Result<()> {
+        if let Some(mut voice) = self.voice.take() {
+            tokio::select! {
+                transport = self.maintain_transport() => transport,
+                audio = voice.run() => audio,
+            }
+        } else {
+            self.maintain_transport().await
+        }
+    }
+
+    async fn maintain_transport(&mut self) -> Result<()> {
         let mut poll = time::interval(Duration::from_secs(2));
         loop {
             let status = self.update(&mut poll).await?;
@@ -225,5 +252,41 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.peer.close();
+    }
+}
+
+async fn create_offer(peer: &PeerConnection) -> Result<SessionDescription> {
+    // Legacy offer-to-receive flags override the transceiver directions.
+    Ok(peer
+        .create_offer(OfferOptions {
+            offer_to_receive_audio: None,
+            offer_to_receive_video: None,
+            ..OfferOptions::default()
+        })
+        .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offer_keeps_bidirectional_microphone() -> Result<()> {
+        let factory = PeerConnectionFactory::default();
+        let peer = factory.create_peer_connection(RtcConfiguration::default())?;
+        let _voice = voice::Session::prepare(
+            &factory,
+            &peer,
+            voice::Settings {
+                mode: voice::Mode::Tone,
+                send: [1; 32],
+                receive: [2; 32],
+                a_side: true,
+            },
+        )?;
+        let sdp = create_offer(&peer).await?.to_string();
+        let microphone = sdp.split_once("m=audio ").unwrap().1;
+        assert!(microphone.lines().any(|line| line == "a=sendrecv"));
+        Ok(())
     }
 }

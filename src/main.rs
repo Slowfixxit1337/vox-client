@@ -20,6 +20,8 @@ use vox_protocol::*;
 mod desktop;
 #[cfg(all(windows, feature = "webrtc"))]
 mod media;
+#[cfg(all(windows, feature = "webrtc"))]
+mod voice;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,13 +33,38 @@ struct Profile {
     device: String,
     credential: String,
     test_ca: Option<PathBuf>,
+    voice: Option<VoiceProfile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceProfile {
+    send_key: String,
+    receive_key: String,
+}
+
+impl VoiceProfile {
+    fn keys(&self) -> Result<([u8; 32], [u8; 32])> {
+        let mut send = [0; 32];
+        let mut receive = [0; 32];
+        hex::decode_to_slice(&self.send_key, &mut send).context("invalid voice send key")?;
+        hex::decode_to_slice(&self.receive_key, &mut receive)
+            .context("invalid voice receive key")?;
+        anyhow::ensure!(
+            send != [0; 32] && receive != [0; 32] && send != receive,
+            "voice needs distinct, nonzero directional keys"
+        );
+        Ok((send, receive))
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let [dev, server, address, lab, file, route, choice] = args.as_slice() else {
-        anyhow::bail!("usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu");
+    let [dev, server, address, lab, file, route, choice, audio @ ..] = args.as_slice() else {
+        anyhow::bail!(
+            "usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu [--audio tone|mic]"
+        );
     };
     anyhow::ensure!(
         cfg!(feature = "lab")
@@ -48,6 +75,13 @@ async fn main() -> Result<()> {
         "this command requires the lab feature and explicit dev flags"
     );
     anyhow::ensure!(choice == "sfu", "this build only supports the SFU route");
+    let audio = match audio {
+        [] => None,
+        [flag, mode] if flag == "--audio" && matches!(mode.as_str(), "tone" | "mic") => {
+            Some(mode.as_str())
+        }
+        _ => anyhow::bail!("expected [--audio tone|mic]"),
+    };
     let address = DevAddress::parse(address)?;
     let file = Path::new(file);
     let profile: Profile =
@@ -61,6 +95,21 @@ async fn main() -> Result<()> {
             test_connector(&base.join(ca))
         })
         .transpose()?;
+    let voice_keys = audio
+        .map(|_| {
+            anyhow::ensure!(
+                cfg!(all(windows, feature = "webrtc")),
+                "voice requires a native WebRTC build"
+            );
+            profile
+                .voice
+                .as_ref()
+                .context("voice needs a profile generated with vox-lab init --voice")?
+                .keys()
+        })
+        .transpose()?;
+    #[cfg(all(windows, feature = "webrtc"))]
+    let a_side = profile.device == "a";
 
     let reply = timeout(EXCHANGE_TIMEOUT, join(&address, profile, tls.clone()))
         .await
@@ -69,13 +118,34 @@ async fn main() -> Result<()> {
     {
         let connection = timeout(
             EXCHANGE_TIMEOUT,
-            media::Connection::connect(&address, reply, tls),
+            media::Connection::connect(
+                &address,
+                reply,
+                tls,
+                audio
+                    .zip(voice_keys)
+                    .map(|(mode, (send, receive))| voice::Settings {
+                        mode: if mode == "mic" {
+                            voice::Mode::Mic
+                        } else {
+                            voice::Mode::Tone
+                        },
+                        send,
+                        receive,
+                        a_side,
+                    }),
+            ),
         )
         .await
         .context("ICE/DTLS setup timed out")??;
         println!(
-            "DEV {} | SFU ICE/DTLS connected | media disabled",
-            address.authority()
+            "DEV {} | SFU ICE/DTLS connected | {}",
+            address.authority(),
+            audio.map_or("media disabled", |mode| if mode == "mic" {
+                "E2EE microphone"
+            } else {
+                "E2EE test tone"
+            }),
         );
         #[cfg(feature = "desktop")]
         {
@@ -86,7 +156,12 @@ async fn main() -> Result<()> {
             });
             desktop::show(
                 address.authority(),
-                "ICE/DTLS с SFU установлен. Передача медиа отключена.".into(),
+                if audio.is_some() {
+                    "ICE/DTLS с SFU установлен. Лабораторный аудиорежим E2EE."
+                } else {
+                    "ICE/DTLS с SFU установлен. Передача медиа отключена."
+                }
+                .into(),
             );
             task.abort();
         }
@@ -95,6 +170,7 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(all(windows, feature = "webrtc")))]
     {
+        debug_assert!(voice_keys.is_none());
         println!(
             "DEV {} | signaling joined generation {} | media unavailable",
             address.authority(),

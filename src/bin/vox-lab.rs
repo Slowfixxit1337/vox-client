@@ -10,6 +10,14 @@ struct ClientProfile<'a> {
     room: &'a str,
     device: &'a str,
     credential: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice: Option<VoiceProfile<'a>>,
+}
+
+#[derive(Serialize)]
+struct VoiceProfile<'a> {
+    send_key: &'a str,
+    receive_key: &'a str,
 }
 
 #[derive(Serialize)]
@@ -22,22 +30,40 @@ struct AdmissionFile<'a> {
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (path, sfu_url) = match args.as_slice() {
-        [verb, flag, path] if verb == "init" && flag == "--out" => {
-            (path, "wss://vox-lab.test:8443/v1/sfu")
-        }
-        [verb, flag, path, option, url]
-            if verb == "init" && flag == "--out" && option == "--sfu-url" =>
-        {
-            (path, url.as_str())
-        }
-        _ => anyhow::bail!("usage: vox-lab init --out NEW_DIRECTORY [--sfu-url WSS_URL]"),
+    let [verb, flag, path, rest @ ..] = args.as_slice() else {
+        anyhow::bail!("usage: vox-lab init --out NEW_DIRECTORY [--sfu-url WSS_URL] [--voice]");
     };
-    let sfu_url = DevAddress::from_sfu_url(sfu_url)?.sfu_url();
+    anyhow::ensure!(
+        verb == "init" && flag == "--out",
+        "expected init --out NEW_DIRECTORY"
+    );
+    let mut options = rest;
+    let mut sfu_url = None;
+    let mut voice = false;
+    while !options.is_empty() {
+        options = match options {
+            [flag, value, tail @ ..] if flag == "--sfu-url" && sfu_url.is_none() => {
+                sfu_url = Some(value.as_str());
+                tail
+            }
+            [flag, tail @ ..] if flag == "--voice" && !voice => {
+                voice = true;
+                tail
+            }
+            _ => anyhow::bail!("expected [--sfu-url WSS_URL] [--voice]"),
+        };
+    }
+    let sfu_url =
+        DevAddress::from_sfu_url(sfu_url.unwrap_or("wss://vox-lab.test:8443/v1/sfu"))?.sfu_url();
     let path = Path::new(path);
     fs::create_dir(path).context("the output directory must be new")?;
+    let voice_keys = if voice {
+        Some([random_secret()?, random_secret()?])
+    } else {
+        None
+    };
     let mut credential_hashes = BTreeMap::new();
-    for device in ["a", "b"] {
+    for (local, device) in ["a", "b"].into_iter().enumerate() {
         let credential = random_secret()?;
         credential_hashes.insert(device, hex::encode(Sha256::digest(credential.as_bytes())));
         write_profile(
@@ -46,6 +72,10 @@ fn main() -> Result<()> {
                 room: "media",
                 device,
                 credential,
+                voice: voice_keys.as_ref().map(|keys| VoiceProfile {
+                    send_key: &keys[local],
+                    receive_key: &keys[1 - local],
+                }),
             },
         )?;
     }
