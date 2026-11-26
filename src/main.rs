@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     }
     let [dev, server, address, lab, file, route, choice, options @ ..] = args.as_slice() else {
         anyhow::bail!(
-            "usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu [--audio tone|mic] [--video test]"
+            "usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu [--audio tone|mic] [--video test|share]"
         );
     };
     anyhow::ensure!(
@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     );
     anyhow::ensure!(choice == "sfu", "this build only supports the SFU route");
     let mut audio = None;
-    let mut video = false;
+    let mut video = None;
     let mut options = options;
     while !options.is_empty() {
         options = match options {
@@ -98,36 +98,33 @@ async fn main() -> Result<()> {
                 audio = Some(mode.as_str());
                 tail
             }
-            [flag, mode, tail @ ..] if flag == "--video" && mode == "test" && !video => {
-                video = true;
+            [flag, mode, tail @ ..]
+                if flag == "--video"
+                    && matches!(mode.as_str(), "test" | "share")
+                    && video.is_none() =>
+            {
+                video = Some(mode.as_str());
                 tail
             }
-            _ => anyhow::bail!("expected [--audio tone|mic] [--video test]"),
+            _ => anyhow::bail!("expected [--audio tone|mic] [--video test|share]"),
         };
     }
     let address = DevAddress::parse(address)?;
-    let file = Path::new(file);
-    let profile: Profile =
-        toml::from_str(&fs::read_to_string(file).context("reading lab profile")?)
-            .map_err(|_| anyhow::anyhow!("invalid lab profile"))?;
-    let tls = profile
-        .test_ca
-        .as_ref()
-        .map(|ca| {
-            let base = file.parent().unwrap_or_else(|| Path::new("."));
-            test_connector(&base.join(ca))
-        })
-        .transpose()?;
+    let (profile, tls) = load_lab_profile(Path::new(file))?;
     let video_keys = video
-        .then(|| {
+        .map(|mode| {
             anyhow::ensure!(
                 cfg!(all(windows, feature = "webrtc")),
                 "video requires native WebRTC"
             );
+            anyhow::ensure!(
+                mode != "share" || cfg!(feature = "desktop"),
+                "screen share requires the desktop feature"
+            );
             profile
                 .video
                 .as_ref()
-                .context("test video needs vox-lab init --video")?
+                .context("video needs vox-lab init --video")?
                 .keys()
         })
         .transpose()?;
@@ -152,6 +149,13 @@ async fn main() -> Result<()> {
         .context("Vox signaling timed out")??;
     #[cfg(all(windows, feature = "webrtc"))]
     {
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        let (desktop_feed, pipeline) = if video == Some("share") {
+            let (ui, video) = video::share::channel();
+            (Some(ui), Some(video))
+        } else {
+            (None, None)
+        };
         let connection = timeout(
             EXCHANGE_TIMEOUT,
             media::Connection::connect(
@@ -174,6 +178,8 @@ async fn main() -> Result<()> {
                     send,
                     receive,
                     a_side,
+                    #[cfg(all(feature = "desktop", feature = "lab"))]
+                    share: pipeline,
                 }),
             ),
         )
@@ -183,8 +189,8 @@ async fn main() -> Result<()> {
             "DEV {} | SFU ICE/DTLS connected | {}",
             address.authority(),
             audio.map_or(
-                if video {
-                    "E2EE VP8 test video"
+                if video.is_some() {
+                    "E2EE VP8 video"
                 } else {
                     "media disabled"
                 },
@@ -202,9 +208,15 @@ async fn main() -> Result<()> {
                     eprintln!("Vox media transport closed: {error}");
                 }
             });
+            #[cfg(feature = "lab")]
+            if let Some(feed) = desktop_feed {
+                desktop::show_share(address.authority(), feed);
+                task.abort();
+                return Ok(());
+            }
             desktop::show(
                 address.authority(),
-                if video {
+                if video.is_some() {
                     "ICE/DTLS с SFU установлен. Лабораторное видео VP8 с E2EE."
                 } else if audio.is_some() {
                     "ICE/DTLS с SFU установлен. Лабораторный аудиорежим E2EE."
@@ -237,6 +249,21 @@ async fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn load_lab_profile(file: &Path) -> Result<(Profile, Option<Connector>)> {
+    let profile: Profile =
+        toml::from_str(&fs::read_to_string(file).context("reading lab profile")?)
+            .map_err(|_| anyhow::anyhow!("invalid lab profile"))?;
+    let tls = profile
+        .test_ca
+        .as_ref()
+        .map(|ca| {
+            let base = file.parent().unwrap_or_else(|| Path::new("."));
+            test_connector(&base.join(ca))
+        })
+        .transpose()?;
+    Ok((profile, tls))
 }
 
 fn test_connector(file: &Path) -> Result<Connector> {

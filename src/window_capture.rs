@@ -439,7 +439,156 @@ fn copy_bgra(mapped: &[u8], pitch: usize, width: usize, height: usize) -> Result
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use super::*;
+    use std::time::Instant;
+    use windows::{
+        Win32::{
+            Foundation::{
+                COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, LPARAM, LRESULT, WPARAM,
+            },
+            Graphics::Gdi::{
+                BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+            },
+            System::LibraryLoader::GetModuleHandleW,
+            System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
+                PeekMessageW, RegisterClassW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+                SetWindowPos, SetWindowTextW, WM_PAINT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            },
+        },
+        core::{factory, w},
+    };
+    pub(crate) const TEST_BGR: [u8; 3] = [42, 112, 212];
+
+    unsafe extern "system" fn draw_test_window(
+        hwnd: HWND,
+        msg: u32,
+        w: WPARAM,
+        l: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_PAINT {
+            unsafe {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let color = u32::from_le_bytes([TEST_BGR[2], TEST_BGR[1], TEST_BGR[0], 0]);
+                let brush = CreateSolidBrush(COLORREF(color));
+                FillRect(dc, &paint.rcPaint, brush);
+                let _ = DeleteObject(brush.into());
+                let _ = EndPaint(hwnd, &paint);
+            }
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, w, l) }
+    }
+
+    pub(crate) struct TestWindow {
+        hwnd: HWND,
+        _apartment: Apartment,
+    }
+
+    impl TestWindow {
+        pub(crate) fn new() -> Result<Self> {
+            unsafe { RoInitialize(RO_INIT_MULTITHREADED)? };
+            let apartment = Apartment;
+            let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
+            let class = w!("VoxWgcTestWindow");
+            if unsafe {
+                RegisterClassW(&WNDCLASSW {
+                    hInstance: instance,
+                    lpfnWndProc: Some(draw_test_window),
+                    lpszClassName: class,
+                    ..Default::default()
+                })
+            } == 0
+            {
+                let error = windows::core::Error::from_thread();
+                if error.code() != windows::core::HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0)
+                {
+                    return Err(error.into());
+                }
+            }
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    class,
+                    w!("Vox WGC smoke test"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    80,
+                    80,
+                    440,
+                    320,
+                    None,
+                    None,
+                    Some(instance),
+                    None,
+                )?
+            };
+            Ok(Self {
+                hwnd,
+                _apartment: apartment,
+            })
+        }
+
+        pub(crate) fn capture(&self) -> Result<Receiver<Result<Frame>>> {
+            let item: GraphicsCaptureItem = unsafe {
+                factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?
+                    .CreateForWindow(self.hwnd)?
+            };
+            frames(Source::Window {
+                item,
+                borderless: false,
+            })
+        }
+
+        pub(crate) fn animate(&self, alternate: bool) -> Result<()> {
+            unsafe {
+                SetWindowTextW(
+                    self.hwnd,
+                    if alternate {
+                        w!("Vox WGC frame A")
+                    } else {
+                        w!("Vox WGC frame B")
+                    },
+                )?
+            };
+            pump_messages();
+            Ok(())
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    impl TestWindow {
+        pub(crate) fn close_and_wait(&mut self, frames: &Receiver<Result<Frame>>) -> Result<()> {
+            self.close();
+            let until = Instant::now() + Duration::from_secs(3);
+            while !frames.is_closed() && Instant::now() < until {
+                pump_messages();
+            }
+            ensure!(frames.is_closed(), "closing the source did not end capture");
+            Ok(())
+        }
+
+        fn close(&mut self) {
+            let hwnd = std::mem::take(&mut self.hwnd);
+            if !hwnd.0.is_null() {
+                let _ = unsafe { DestroyWindow(hwnd) };
+            }
+        }
+    }
+
+    fn pump_messages() {
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe { DispatchMessageW(&msg) };
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     #[test]
     fn strips_gpu_row_padding_and_makes_preview_opaque() -> anyhow::Result<()> {
         let mapped = [1, 2, 3, 0, 90, 91, 92, 93, 4, 5, 6, 127];
@@ -455,61 +604,16 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive Windows desktop with WGC and D3D11"]
     fn reads_frames_from_a_test_window_after_resize() -> super::Result<()> {
-        use super::*;
-        use std::time::Instant;
-        use windows::{
-            Win32::{
-                System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop,
-                UI::WindowsAndMessaging::{
-                    CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
-                    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, SetWindowTextW,
-                    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-                },
-            },
-            core::{factory, w},
-        };
-
-        struct TestWindow(HWND);
-        impl Drop for TestWindow {
-            fn drop(&mut self) {
-                let _ = unsafe { DestroyWindow(self.0) };
-            }
-        }
-
-        unsafe { RoInitialize(RO_INIT_MULTITHREADED)? };
-        let _apartment = Apartment;
-        let window = TestWindow(unsafe {
-            CreateWindowExW(
-                Default::default(),
-                w!("STATIC"),
-                w!("Vox WGC smoke test"),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                80,
-                80,
-                440,
-                320,
-                None,
-                None,
-                None,
-                None,
-            )?
-        });
-        let item: GraphicsCaptureItem = unsafe {
-            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?
-                .CreateForWindow(window.0)?
-        };
-        let frames = frames(Source::Window {
-            item,
-            borderless: false,
-        })?;
-        let first = next_frame(window.0, &frames, |_| true).context("initial window frame")?;
+        let mut window = TestWindow::new()?;
+        let frames = window.capture()?;
+        let first = next_frame(&window, &frames, |_| true).context("initial window frame")?;
         assert_eq!(
             first.bgra.len(),
             first.width as usize * first.height as usize * 4
         );
         unsafe {
             SetWindowPos(
-                window.0,
+                window.hwnd,
                 None,
                 0,
                 0,
@@ -518,7 +622,7 @@ mod tests {
                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
             )?;
         }
-        let resized = next_frame(window.0, &frames, |frame| {
+        let resized = next_frame(&window, &frames, |frame| {
             frame.width > first.width && frame.height > first.height
         })
         .with_context(|| {
@@ -531,25 +635,11 @@ mod tests {
             resized.bgra.len(),
             resized.width as usize * resized.height as usize * 4
         );
-        drop(window);
-
-        let until = Instant::now() + Duration::from_secs(3);
-        while !frames.is_closed() && Instant::now() < until {
-            pump_messages();
-        }
-        assert!(frames.is_closed(), "closing the source did not end capture");
+        window.close_and_wait(&frames)?;
         return Ok(());
 
-        fn pump_messages() {
-            let mut msg = MSG::default();
-            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                unsafe { DispatchMessageW(&msg) };
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
         fn next_frame(
-            window: HWND,
+            window: &TestWindow,
             frames: &Receiver<Result<Frame>>,
             matches: impl Fn(&Frame) -> bool,
         ) -> Result<Frame> {
@@ -558,17 +648,7 @@ mod tests {
             while Instant::now() < until {
                 // Keep the instrumented compositor surface changing, as a game would.
                 alternate = !alternate;
-                unsafe {
-                    SetWindowTextW(
-                        window,
-                        if alternate {
-                            w!("Vox WGC frame A")
-                        } else {
-                            w!("Vox WGC frame B")
-                        },
-                    )?
-                };
-                pump_messages();
+                window.animate(alternate)?;
                 match frames.try_recv() {
                     Ok(frame) => {
                         let frame = frame?;

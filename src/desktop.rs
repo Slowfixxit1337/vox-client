@@ -3,10 +3,15 @@ use gpui_kit::{
 };
 
 pub fn show(authority: &str, status: String) {
-    show_view(format!("Vox DEV | {authority}"), StatusView(status));
+    show_view(format!("Vox DEV | {authority}"), move |_, _| {
+        StatusView(status)
+    });
 }
 
-fn show_view<V: Render + 'static>(title: String, view: V) {
+fn show_view<V: Render + 'static>(
+    title: String,
+    view: impl FnOnce(&mut Window, &mut Context<V>) -> V + 'static,
+) {
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         let options = WindowOptions {
@@ -16,7 +21,9 @@ fn show_view<V: Render + 'static>(title: String, view: V) {
             }),
             ..Default::default()
         };
-        if let Err(error) = gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| view)) {
+        if let Err(error) =
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| view(window, cx)))
+        {
             eprintln!("Не удалось открыть окно Vox: {error}");
             cx.quit();
         }
@@ -33,11 +40,23 @@ impl Render for StatusView {
 
 #[cfg(feature = "lab")]
 pub fn capture_preview() {
-    show_view("Vox DEV | Предпросмотр".into(), preview::Preview::default());
+    show_view("Vox DEV | Предпросмотр".into(), |_, _| {
+        preview::Preview::default()
+    });
+}
+
+#[cfg(all(feature = "webrtc", feature = "lab"))]
+pub fn show_share(authority: &str, feed: crate::video::share::DesktopFeed) {
+    show_view(
+        format!("Vox DEV | Демонстрация | {authority}"),
+        move |window, cx| preview::Preview::sharing(window, cx, feed),
+    );
 }
 
 #[cfg(feature = "lab")]
 mod preview {
+    #[cfg(feature = "webrtc")]
+    use crate::video::share::DesktopFeed;
     use crate::window_capture::{self, Source};
     use anyhow::Context as _;
     use gpui_kit::{
@@ -48,6 +67,8 @@ mod preview {
     };
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::sync::Arc;
+    #[cfg(feature = "webrtc")]
+    use tokio::sync::watch;
     use windows::Win32::Foundation::HWND;
 
     #[derive(Default)]
@@ -57,6 +78,16 @@ mod preview {
         choosing: bool,
         monitors: Vec<String>,
         status: String,
+        #[cfg(feature = "webrtc")]
+        peer: Option<PeerPreview>,
+    }
+
+    #[cfg(feature = "webrtc")]
+    struct PeerPreview {
+        capture: watch::Sender<Option<Arc<window_capture::Frame>>>,
+        image: Option<Arc<RenderImage>>,
+        disconnected: bool,
+        _viewer: Task<()>,
     }
 
     enum Selection {
@@ -65,6 +96,53 @@ mod preview {
     }
 
     impl Preview {
+        #[cfg(feature = "webrtc")]
+        pub(super) fn sharing(window: &Window, cx: &mut Context<Self>, feed: DesktopFeed) -> Self {
+            let DesktopFeed {
+                capture,
+                mut received,
+            } = feed;
+            let viewer = cx.spawn_in(window, async move |view, cx| {
+                while received.changed().await.is_ok() {
+                    let frame = received.borrow_and_update().clone();
+                    let image = frame.and_then(|frame| {
+                        render_image(frame.width, frame.height, frame.bgra.clone())
+                    });
+                    if view
+                        .update_in(cx, |view, window, cx| {
+                            if let Some(peer) = view.peer.as_mut() {
+                                replace_image(&mut peer.image, image, window);
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = view.update_in(cx, |view, window, cx| {
+                    view.stop_capture(window);
+                    view.choosing = false;
+                    view.monitors.clear();
+                    view.status.clear();
+                    if let Some(peer) = view.peer.as_mut() {
+                        peer.disconnected = true;
+                        replace_image(&mut peer.image, None, window);
+                    }
+                    cx.notify();
+                });
+            });
+            Self {
+                peer: Some(PeerPreview {
+                    capture,
+                    image: None,
+                    disconnected: false,
+                    _viewer: viewer,
+                }),
+                ..Self::default()
+            }
+        }
+
         fn start_window(&mut self, borderless: bool, window: &mut Window, cx: &mut Context<Self>) {
             let hwnd = match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
                 Ok(RawWindowHandle::Win32(handle)) => HWND(handle.hwnd.get() as _),
@@ -88,6 +166,8 @@ mod preview {
 
         fn start(&mut self, selection: Selection, window: &Window, cx: &mut Context<Self>) {
             self.monitors.clear();
+            #[cfg(feature = "webrtc")]
+            let outgoing = self.peer.as_ref().map(|peer| peer.capture.clone());
             self.task = Some(cx.spawn_in(window, async move |view, cx| {
                 let result = async {
                     let (source, label) = match selection {
@@ -112,15 +192,22 @@ mod preview {
                     })?;
                     while let Ok(frame) = frames.recv().await {
                         let frame = frame?;
-                        let pixels =
-                            image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
-                                .context("неверный размер кадра")?;
-                        let image = Arc::new(RenderImage::new([image::Frame::new(pixels)]));
+                        let (width, height) = (frame.width, frame.height);
+                        #[cfg(feature = "webrtc")]
+                        let pixels = if let Some(outgoing) = &outgoing {
+                            let pixels = frame.bgra.clone();
+                            outgoing.send_replace(Some(Arc::new(frame)));
+                            pixels
+                        } else {
+                            frame.bgra
+                        };
+                        #[cfg(not(feature = "webrtc"))]
+                        let pixels = frame.bgra;
+                        let image =
+                            render_image(width, height, pixels).context("неверный размер кадра")?;
                         view.update_in(cx, |view, window, cx| {
-                            view.status = format!("{label} · {} × {}", frame.width, frame.height);
-                            if let Some(old) = view.image.replace(image) {
-                                let _ = window.drop_image(old);
-                            }
+                            view.status = format!("{label} · {width} × {height}");
+                            replace_image(&mut view.image, Some(image), window);
                             cx.notify();
                         })?;
                     }
@@ -128,13 +215,12 @@ mod preview {
                 }
                 .await;
                 let _ = view.update_in(cx, |view, window, cx| {
-                    view.clear_image(window);
+                    view.stop_capture(window);
                     view.choosing = false;
                     view.status = match result {
                         Ok(message) => message.into(),
                         Err(error) => format!("Не удалось захватить источник. {error}"),
                     };
-                    view.task = None;
                     cx.notify();
                 });
             }));
@@ -142,16 +228,42 @@ mod preview {
         }
 
         fn clear_image(&mut self, window: &mut Window) {
-            if let Some(image) = self.image.take() {
-                let _ = window.drop_image(image);
+            replace_image(&mut self.image, None, window);
+        }
+
+        fn stop_capture(&mut self, window: &mut Window) {
+            self.task = None;
+            self.clear_image(window);
+            #[cfg(feature = "webrtc")]
+            if let Some(peer) = &self.peer {
+                peer.capture.send_replace(None);
             }
+        }
+    }
+
+    fn render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
+        let pixels = image::RgbaImage::from_raw(width, height, bgra)?;
+        Some(Arc::new(RenderImage::new([image::Frame::new(pixels)])))
+    }
+
+    fn replace_image(
+        slot: &mut Option<Arc<RenderImage>>,
+        frame: Option<Arc<RenderImage>>,
+        window: &mut Window,
+    ) {
+        if let Some(image) = std::mem::replace(slot, frame) {
+            let _ = window.drop_image(image);
         }
     }
 
     impl Render for Preview {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let active = self.task.is_some();
-            div()
+            #[cfg(feature = "webrtc")]
+            let controls = self.peer.as_ref().is_none_or(|peer| !peer.disconnected);
+            #[cfg(not(feature = "webrtc"))]
+            let controls = true;
+            let view = div()
                 .size_full()
                 .p_4()
                 .flex()
@@ -163,14 +275,13 @@ mod preview {
                             .label("Остановить")
                             .disabled(self.choosing)
                             .on_click(cx.listener(|view, _, window, cx| {
-                                view.task = None;
-                                view.clear_image(window);
+                                view.stop_capture(window);
                                 view.status = "Захват остановлен".into();
                                 cx.notify();
                             })),
                     )
                 })
-                .when(!active, |element| {
+                .when(!active && controls, |element| {
                     element.child(
                         div()
                             .flex()
@@ -238,7 +349,33 @@ mod preview {
                             .min_h_0()
                             .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
                     )
-                })
+                });
+            #[cfg(feature = "webrtc")]
+            let view = view.when_some(self.peer.as_ref(), |element, peer| {
+                element.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .child(if peer.disconnected {
+                            "Соединение закрыто"
+                        } else if peer.image.is_some() {
+                            "Демонстрация собеседника · E2EE"
+                        } else {
+                            "Ожидаем демонстрацию собеседника"
+                        })
+                        .when_some(peer.image.clone(), |pane, frame| {
+                            pane.child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
+                            )
+                        }),
+                )
+            });
+            view
         }
     }
 }

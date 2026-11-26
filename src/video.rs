@@ -24,10 +24,15 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 180;
 const ID: &str = "vox-lab-share-video";
 
+#[cfg(all(feature = "desktop", feature = "lab"))]
+pub(crate) mod share;
+
 pub struct Settings {
     pub send: [u8; 32],
     pub receive: [u8; 32],
     pub a_side: bool,
+    #[cfg(all(feature = "desktop", feature = "lab"))]
+    pub share: Option<share::Pipeline>,
 }
 
 pub struct Session {
@@ -38,6 +43,10 @@ pub struct Session {
     receiver: FrameCryptor,
     errors: mpsc::Receiver<(bool, EncryptionState)>,
     a_side: bool,
+    #[cfg(all(feature = "desktop", feature = "lab"))]
+    share: Option<share::Pipeline>,
+    #[cfg(all(feature = "desktop", feature = "lab"))]
+    rtp_sender: libwebrtc::rtp_sender::RtpSender,
 }
 
 impl Session {
@@ -56,12 +65,23 @@ impl Session {
         let local =
             MediaStreamTrack::from(factory.create_video_track("vox-share-video", source.clone()));
         local.set_enabled(false);
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        let encodings = if settings.share.is_some() {
+            vec![libwebrtc::rtp_parameters::RtpEncodingParameters {
+                active: false,
+                ..Default::default()
+            }]
+        } else {
+            vec![]
+        };
+        #[cfg(not(all(feature = "desktop", feature = "lab")))]
+        let encodings = vec![];
         let transceiver = peer.add_transceiver(
             local.clone(),
             RtpTransceiverInit {
                 direction: RtpTransceiverDirection::SendRecv,
                 stream_ids: vec![],
-                send_encodings: vec![],
+                send_encodings: encodings,
             },
         )?;
         let vp8: Vec<_> = factory
@@ -76,12 +96,13 @@ impl Session {
             Some(MediaStreamTrack::Video(track)) => NativeVideoStream::new(track),
             _ => anyhow::bail!("ShareVideo transceiver has no video receiver"),
         };
+        let rtp_sender = transceiver.sender();
         let sender = FrameCryptor::new_for_rtp_sender(
             factory,
             ID.into(),
             EncryptionAlgorithm::AesGcm,
             keys(settings.send)?,
-            transceiver.sender(),
+            rtp_sender.clone(),
         );
         let receiver = FrameCryptor::new_for_rtp_receiver(
             factory,
@@ -119,6 +140,10 @@ impl Session {
             receiver,
             errors,
             a_side: settings.a_side,
+            #[cfg(all(feature = "desktop", feature = "lab"))]
+            share: settings.share,
+            #[cfg(all(feature = "desktop", feature = "lab"))]
+            rtp_sender,
         })
     }
 
@@ -127,6 +152,10 @@ impl Session {
             self.sender.enabled() && self.receiver.enabled(),
             "VP8 frame cryptors are inactive"
         );
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        if let Some(share) = self.share.take() {
+            return self.run_share(share).await;
+        }
         self.local.set_enabled(true);
         let mut tick = time::interval(Duration::from_millis(80));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
