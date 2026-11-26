@@ -14,6 +14,8 @@ struct ClientProfile<'a> {
     voice: Option<MediaKeys<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     video: Option<MediaKeys<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    share_audio: Option<MediaKeys<'a>>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +78,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let share_audio_keys = if video {
+        Some([random_secret()?, random_secret()?])
+    } else {
+        None
+    };
     let mut credential_hashes = BTreeMap::new();
     for (local, device) in ["a", "b"].into_iter().enumerate() {
         let credential = random_secret()?;
@@ -91,6 +98,10 @@ fn main() -> Result<()> {
                     receive_key: &keys[1 - local],
                 }),
                 video: video_keys.as_ref().map(|keys| MediaKeys {
+                    send_key: &keys[local],
+                    receive_key: &keys[1 - local],
+                }),
+                share_audio: share_audio_keys.as_ref().map(|keys| MediaKeys {
                     send_key: &keys[local],
                     receive_key: &keys[1 - local],
                 }),

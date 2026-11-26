@@ -259,6 +259,7 @@ mod tests {
                 receive,
                 a_side,
                 share: Some(pipeline),
+                audio: None,
             }),
         )
         .await?;

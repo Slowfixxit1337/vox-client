@@ -16,10 +16,16 @@ use tokio_tungstenite::{
 use vox_client::DevAddress;
 use vox_protocol::*;
 
+#[cfg(all(windows, feature = "lab", feature = "desktop", feature = "webrtc"))]
+mod audio_targets;
 #[cfg(all(windows, feature = "desktop"))]
 mod desktop;
+#[cfg(all(windows, feature = "lab", feature = "desktop", feature = "webrtc"))]
+mod game_audio;
 #[cfg(all(windows, feature = "webrtc"))]
 mod media;
+#[cfg(all(windows, feature = "lab", feature = "desktop", feature = "webrtc"))]
+mod process_audio;
 #[cfg(all(windows, feature = "webrtc"))]
 mod video;
 #[cfg(all(windows, feature = "webrtc"))]
@@ -39,6 +45,8 @@ struct Profile {
     test_ca: Option<PathBuf>,
     voice: Option<MediaKeys>,
     video: Option<MediaKeys>,
+    #[serde(rename = "share_audio")]
+    _share_audio: Option<MediaKeys>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +151,13 @@ async fn main() -> Result<()> {
         .transpose()?;
     #[cfg(all(windows, feature = "webrtc"))]
     let a_side = profile.device == "a";
+    #[cfg(all(windows, feature = "webrtc", feature = "desktop", feature = "lab"))]
+    let share_audio_keys = profile
+        ._share_audio
+        .as_ref()
+        .filter(|_| video == Some("share"))
+        .map(MediaKeys::keys)
+        .transpose()?;
 
     let reply = timeout(EXCHANGE_TIMEOUT, join(&address, profile, tls.clone()))
         .await
@@ -156,6 +171,15 @@ async fn main() -> Result<()> {
         } else {
             (None, None)
         };
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        let (game_audio_ui, game_audio) =
+            match share_audio_keys.filter(|_| reply.allowed_tracks.contains(&Track::ShareAudio)) {
+                Some((send, receive)) => {
+                    let (ui, settings) = game_audio::channel(send, receive);
+                    (Some(ui), Some(settings))
+                }
+                None => (None, None),
+            };
         let connection = timeout(
             EXCHANGE_TIMEOUT,
             media::Connection::connect(
@@ -180,6 +204,8 @@ async fn main() -> Result<()> {
                     a_side,
                     #[cfg(all(feature = "desktop", feature = "lab"))]
                     share: pipeline,
+                    #[cfg(all(feature = "desktop", feature = "lab"))]
+                    audio: game_audio,
                 }),
             ),
         )
@@ -210,7 +236,7 @@ async fn main() -> Result<()> {
             });
             #[cfg(feature = "lab")]
             if let Some(feed) = desktop_feed {
-                desktop::show_share(address.authority(), feed);
+                desktop::show_share(address.authority(), feed, game_audio_ui);
                 task.abort();
                 return Ok(());
             }

@@ -22,6 +22,8 @@ use vox_protocol::{
 };
 
 use super::{EXCHANGE_TIMEOUT, Socket, exchange, open};
+#[cfg(all(feature = "desktop", feature = "lab"))]
+use crate::game_audio;
 use crate::{video, voice};
 
 pub struct Connection {
@@ -34,6 +36,8 @@ pub struct Connection {
     receiver_guard: Option<FrameCryptor>,
     voice: Option<voice::Session>,
     video: Option<video::Session>,
+    #[cfg(all(feature = "desktop", feature = "lab"))]
+    game_audio: Option<game_audio::Session>,
 }
 
 impl Connection {
@@ -99,10 +103,16 @@ impl Connection {
             receiver_guard: None,
             voice: None,
             video: None,
+            #[cfg(all(feature = "desktop", feature = "lab"))]
+            game_audio: None,
         };
 
         let mut voice_settings = voice_settings;
         let mut video_settings = video_settings;
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        let mut game_audio_settings = video_settings
+            .as_mut()
+            .and_then(|settings| settings.audio.take());
         for (index, kind) in [
             MediaType::Audio,
             MediaType::Video,
@@ -112,6 +122,22 @@ impl Connection {
         .into_iter()
         .enumerate()
         {
+            #[cfg(all(feature = "desktop", feature = "lab"))]
+            if index == 2
+                && let Some(settings) = game_audio_settings.take()
+            {
+                ensure!(
+                    room.allowed_tracks
+                        .contains(&vox_protocol::Track::ShareAudio),
+                    "ticket does not allow ShareAudio"
+                );
+                connection.game_audio = Some(game_audio::Session::prepare(
+                    &factory,
+                    &connection.peer,
+                    settings,
+                )?);
+                continue;
+            }
             if index == 1
                 && let Some(settings) = video_settings.take()
             {
@@ -220,6 +246,19 @@ impl Connection {
     pub async fn maintain(mut self) -> Result<()> {
         let mut voice = self.voice.take();
         let mut video = self.video.take();
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        let mut game_audio = self.game_audio.take();
+        #[cfg(all(feature = "desktop", feature = "lab"))]
+        let share_audio = async {
+            if let Some(audio) = &mut game_audio
+                && let Err(error) = audio.run().await
+            {
+                audio.unavailable(&error);
+            }
+            pending::<Result<()>>().await
+        };
+        #[cfg(not(all(feature = "desktop", feature = "lab")))]
+        let share_audio = pending::<Result<()>>();
         tokio::select! {
             transport = self.maintain_transport() => transport,
             audio = async {
@@ -234,6 +273,7 @@ impl Connection {
                     None => pending().await,
                 }
             } => share_video,
+            result = share_audio => result,
         }
     }
 

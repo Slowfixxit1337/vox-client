@@ -46,10 +46,14 @@ pub fn capture_preview() {
 }
 
 #[cfg(all(feature = "webrtc", feature = "lab"))]
-pub fn show_share(authority: &str, feed: crate::video::share::DesktopFeed) {
+pub fn show_share(
+    authority: &str,
+    feed: crate::video::share::DesktopFeed,
+    audio: Option<crate::game_audio::Controls>,
+) {
     show_view(
         format!("Vox DEV | Демонстрация | {authority}"),
-        move |window, cx| preview::Preview::sharing(window, cx, feed),
+        move |window, cx| preview::Preview::sharing(window, cx, feed, audio),
     );
 }
 
@@ -58,6 +62,8 @@ mod preview {
     #[cfg(feature = "webrtc")]
     use crate::video::share::DesktopFeed;
     use crate::window_capture::{self, Source};
+    #[cfg(feature = "webrtc")]
+    use crate::{audio_targets, game_audio};
     use anyhow::Context as _;
     use gpui_kit::{
         Context, IntoElement, ObjectFit, Render, RenderImage, Task, Window,
@@ -80,6 +86,8 @@ mod preview {
         status: String,
         #[cfg(feature = "webrtc")]
         peer: Option<PeerPreview>,
+        #[cfg(feature = "webrtc")]
+        audio: Option<GameAudioPreview>,
     }
 
     #[cfg(feature = "webrtc")]
@@ -90,6 +98,16 @@ mod preview {
         _viewer: Task<()>,
     }
 
+    #[cfg(feature = "webrtc")]
+    struct GameAudioPreview {
+        target: watch::Sender<Option<u32>>,
+        listen: watch::Sender<bool>,
+        status: String,
+        choices: Vec<audio_targets::Application>,
+        error: Option<String>,
+        _observer: Task<()>,
+    }
+
     enum Selection {
         Window { owner: HWND, borderless: bool },
         Monitor(String),
@@ -97,7 +115,12 @@ mod preview {
 
     impl Preview {
         #[cfg(feature = "webrtc")]
-        pub(super) fn sharing(window: &Window, cx: &mut Context<Self>, feed: DesktopFeed) -> Self {
+        pub(super) fn sharing(
+            window: &Window,
+            cx: &mut Context<Self>,
+            feed: DesktopFeed,
+            audio: Option<game_audio::Controls>,
+        ) -> Self {
             let DesktopFeed {
                 capture,
                 mut received,
@@ -132,6 +155,39 @@ mod preview {
                     cx.notify();
                 });
             });
+            let audio = audio.map(
+                |game_audio::Controls {
+                     target,
+                     listen,
+                     mut status,
+                 }| {
+                    let initial = status.borrow_and_update().clone();
+                    let observer = cx.spawn_in(window, async move |view, cx| {
+                        while status.changed().await.is_ok() {
+                            let text = status.borrow_and_update().clone();
+                            if view
+                                .update_in(cx, |view, _, cx| {
+                                    if let Some(audio) = &mut view.audio {
+                                        audio.status = text;
+                                        cx.notify();
+                                    }
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                    GameAudioPreview {
+                        target,
+                        listen,
+                        status: initial,
+                        choices: vec![],
+                        error: None,
+                        _observer: observer,
+                    }
+                },
+            );
             Self {
                 peer: Some(PeerPreview {
                     capture,
@@ -139,6 +195,7 @@ mod preview {
                     disconnected: false,
                     _viewer: viewer,
                 }),
+                audio,
                 ..Self::default()
             }
         }
@@ -238,6 +295,100 @@ mod preview {
             if let Some(peer) = &self.peer {
                 peer.capture.send_replace(None);
             }
+            #[cfg(feature = "webrtc")]
+            if let Some(audio) = &mut self.audio {
+                audio.target.send_replace(None);
+                audio.choices.clear();
+                audio.error = None;
+            }
+        }
+
+        #[cfg(feature = "webrtc")]
+        fn render_audio(&self, audio: &GameAudioPreview, cx: &Context<Self>) -> impl IntoElement {
+            let sharing = self.task.is_some() && self.image.is_some();
+            let listening = *audio.listen.borrow();
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .when(sharing, |row| {
+                            row.child(
+                                Button::new("game-audio-source")
+                                    .label("Приложение для звука")
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        if let Some(audio) = &mut view.audio {
+                                            audio.choices.clear();
+                                            audio.error = match audio_targets::applications() {
+                                                Ok(apps) if apps.is_empty() => Some(
+                                                    "Приложения с видимым окном не найдены".into(),
+                                                ),
+                                                Ok(apps) => {
+                                                    audio.choices = apps;
+                                                    None
+                                                }
+                                                Err(error) => Some(format!(
+                                                    "Не удалось получить список приложений. {error}"
+                                                )),
+                                            };
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .when(
+                                audio.target.borrow().is_some(),
+                                |row| {
+                                    row.child(
+                                        Button::new("game-audio-stop")
+                                            .label("Показ без звука")
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                if let Some(audio) = &mut view.audio {
+                                                    audio.target.send_replace(None);
+                                                    audio.choices.clear();
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                },
+                            )
+                        })
+                        .child(
+                            Button::new("game-audio-listen")
+                                .label(if listening {
+                                    "Заглушить звук демки"
+                                } else {
+                                    "Слушать звук демки"
+                                })
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Some(audio) = &view.audio {
+                                        audio.listen.send_modify(|enabled| *enabled = !*enabled);
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+                .when(sharing, |column| column.child(audio.status.clone()))
+                .when_some(audio.error.clone(), |column, error| column.child(error))
+                .children(audio.choices.iter().map(|app| {
+                    let pid = app.pid;
+                    Button::new(("game-audio-app", pid as usize))
+                        .label(app.label.clone())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if view.task.is_some()
+                                && view.image.is_some()
+                                && let Some(audio) = &mut view.audio
+                            {
+                                audio.target.send_replace(Some(pid));
+                                audio.choices.clear();
+                                audio.error = None;
+                                cx.notify();
+                            }
+                        }))
+                }))
         }
     }
 
@@ -350,6 +501,11 @@ mod preview {
                             .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
                     )
                 });
+            #[cfg(feature = "webrtc")]
+            let view = view.when_some(
+                self.audio.as_ref().filter(|_| controls),
+                |element, audio| element.child(self.render_audio(audio, cx)),
+            );
             #[cfg(feature = "webrtc")]
             let view = view.when_some(self.peer.as_ref(), |element, peer| {
                 element.child(

@@ -33,6 +33,8 @@ pub struct Settings {
     pub a_side: bool,
     #[cfg(all(feature = "desktop", feature = "lab"))]
     pub share: Option<share::Pipeline>,
+    #[cfg(all(feature = "desktop", feature = "lab"))]
+    pub audio: Option<crate::game_audio::Settings>,
 }
 
 pub struct Session {

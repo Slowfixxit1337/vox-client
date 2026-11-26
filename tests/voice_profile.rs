@@ -23,7 +23,7 @@ fn audio_and_video_keys_are_distinct_directional_and_absent_from_server_files() 
     let a: Value = toml::from_str(&fs::read_to_string(lab.join("client-a.toml")).unwrap()).unwrap();
     let b: Value = toml::from_str(&fs::read_to_string(lab.join("client-b.toml")).unwrap()).unwrap();
     let mut keys = std::collections::HashSet::new();
-    for track in ["voice", "video"] {
+    for track in ["voice", "video", "share_audio"] {
         let outbound = a[track]["send_key"].as_str().unwrap();
         let inbound = a[track]["receive_key"].as_str().unwrap();
         assert_eq!(Some(outbound), b[track]["receive_key"].as_str());
