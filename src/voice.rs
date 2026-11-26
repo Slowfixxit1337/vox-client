@@ -192,7 +192,7 @@ fn key_provider(key: [u8; 32]) -> Result<KeyProvider> {
         shared_key: false,
         ratchet_window_size: 0,
         ratchet_salt: b"vox-lab/mic/v1".to_vec(),
-        failure_tolerance: -1,
+        failure_tolerance: 0,
         key_ring_size: 1,
         key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
     });
