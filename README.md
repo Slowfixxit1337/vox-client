@@ -1,5 +1,33 @@
 # Vox Client
 
+## Вход и регистрация на Windows
+
+Соберите клиент с `desktop` и запустите его с адресом `vox-api`, у
+которого настроен раздел `[auth]`.
+
+```powershell
+cargo build --locked --features desktop --bin vox-client
+.\target\debug\vox-client.exe --auth --server 127.0.0.1:8443 --ca .\test-ca.pem
+```
+
+Обычный запуск открывает тот же экран и использует `VOX_SERVER` или
+`localhost:8443`. С флагом `--ca` имя или IP сервера всё равно сверяется
+с сертификатом. При входе сессия хранится в `%LOCALAPPDATA%\Vox\accounts`
+отдельно для каждого сервера и шифруется Windows DPAPI.
+
+Регистрация открывает ввод шестизначного кода из письма. После
+подтверждения доступен вход в профиль и выход из аккаунта.
+
+Сквозной тест запускается с `VOX_TEST_AUTH_SERVER`, `VOX_TEST_AUTH_CA` и
+`VOX_TEST_AUTH_OUTBOX`, указывающими на локальный `vox-api` и его
+тестовый почтовый ящик.
+
+```powershell
+cargo test --locked --features desktop --bin vox-client register_confirm_sign_in_and_revoke -- --ignored
+```
+
+## Лабораторный клиент
+
 Стендовый клиент проверяет TLS, согласует версию по WSS и входит в комнату.
 Настройка `lab,webrtc` подключает клиентский ICE/DTLS к SFU через билет
 из управляющего API. Экран `desktop` показывает состояние соединения.

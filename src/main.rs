@@ -19,6 +19,10 @@ use vox_protocol::*;
 #[cfg(all(windows, feature = "lab", feature = "desktop", feature = "webrtc"))]
 mod audio_targets;
 #[cfg(all(windows, feature = "desktop"))]
+mod auth_net;
+#[cfg(all(windows, feature = "desktop"))]
+mod auth_ui;
+#[cfg(all(windows, feature = "desktop"))]
 mod desktop;
 #[cfg(all(windows, feature = "lab", feature = "desktop", feature = "webrtc"))]
 mod game_audio;
@@ -74,6 +78,16 @@ impl MediaKeys {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(all(windows, feature = "desktop"))]
+    if args.is_empty() || args.first().is_some_and(|flag| flag == "--auth") {
+        let options = if args.is_empty() {
+            &args[..]
+        } else {
+            &args[1..]
+        };
+        auth_ui::show(auth_net::Client::from_options(options)?);
+        return Ok(());
+    }
     #[cfg(all(windows, feature = "lab", feature = "desktop"))]
     if args == ["--capture-preview"] {
         desktop::capture_preview();
