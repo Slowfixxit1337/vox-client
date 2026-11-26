@@ -38,3 +38,21 @@ fn rejects_url_parts_and_non_bracketed_ipv6() {
         assert!(DevAddress::parse(input).is_err(), "{input}");
     }
 }
+
+#[test]
+fn sfu_must_use_the_same_verified_tls_origin() {
+    let address = DevAddress::parse("VOX.test:443").unwrap();
+    assert_eq!(
+        address.verified_sfu_url("wss://vox.test/v1/sfu").unwrap(),
+        "wss://vox.test:443/v1/sfu"
+    );
+    for url in [
+        "ws://vox.test/v1/sfu",
+        "wss://other.test/v1/sfu",
+        "wss://vox.test:8443/v1/sfu",
+        "wss://user@vox.test/v1/sfu",
+        "wss://vox.test/v1/sfu?path=/v1/sfu",
+    ] {
+        assert!(address.verified_sfu_url(url).is_err(), "{url}");
+    }
+}

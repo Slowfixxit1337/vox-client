@@ -55,6 +55,26 @@ impl DevAddress {
     pub fn profile_key(&self) -> String {
         hex::encode(Sha256::digest(self.0.as_bytes()))
     }
+
+    pub fn from_sfu_url(url: &str) -> anyhow::Result<Self> {
+        let authority = url
+            .strip_prefix("wss://")
+            .and_then(|rest| rest.strip_suffix("/v1/sfu"))
+            .ok_or_else(|| anyhow::anyhow!("expected a WSS URL for /v1/sfu"))?;
+        Self::parse(authority)
+    }
+
+    pub fn sfu_url(&self) -> String {
+        format!("wss://{}/v1/sfu", self.authority())
+    }
+
+    pub fn verified_sfu_url(&self, url: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            &Self::from_sfu_url(url)? == self,
+            "SFU URL is outside the dev server origin"
+        );
+        Ok(self.sfu_url())
+    }
 }
 
 fn valid_label(label: &str) -> bool {

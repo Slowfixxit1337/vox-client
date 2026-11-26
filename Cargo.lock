@@ -7117,6 +7117,8 @@ dependencies = [
  "hex",
  "libwebrtc",
  "rand 0.10.4",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "sha2 0.10.9",
  "tokio",
@@ -7128,7 +7130,7 @@ dependencies = [
 [[package]]
 name = "vox-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=bc772462604b3d84ee71f1fe43b2834b841958dc#bc772462604b3d84ee71f1fe43b2834b841958dc"
+source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=83c0ef36ad7cbcbdddb20aa15a1838d4924798e1#83c0ef36ad7cbcbdddb20aa15a1838d4924798e1"
 dependencies = [
  "postcard",
  "serde",

@@ -14,16 +14,18 @@ desktop = ["dep:gpui-kit"]
 webrtc = ["dep:libwebrtc"]
 
 [dependencies]
-vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "bc772462604b3d84ee71f1fe43b2834b841958dc" }
+vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "83c0ef36ad7cbcbdddb20aa15a1838d4924798e1" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
 hex = "0.4"
 sha2 = "0.10"
 rand = "0.10"
-tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 
 [target.'cfg(windows)'.dependencies]
 gpui-kit = { version = "=0.11.0", default-features = false, features = ["component"], optional = true }

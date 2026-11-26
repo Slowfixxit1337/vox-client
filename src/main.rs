@@ -1,14 +1,28 @@
 use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use std::{
+    fs,
+    io::BufReader,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{net::TcpStream, time::timeout};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream,
+    tungstenite::{self, Message as WsMessage, protocol::WebSocketConfig},
+};
+use vox_client::DevAddress;
+use vox_protocol::*;
 
 #[cfg(all(windows, feature = "desktop"))]
 mod desktop;
-use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
-use std::{fs, time::Duration};
-use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{self, Message as WsMessage, protocol::WebSocketConfig};
-use vox_client::DevAddress;
-use vox_protocol::*;
+#[cfg(all(windows, feature = "webrtc"))]
+mod media;
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +30,7 @@ struct Profile {
     room: String,
     device: String,
     credential: String,
+    test_ca: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -32,73 +47,136 @@ async fn main() -> Result<()> {
             && route == "--media-route",
         "this command requires the lab feature and explicit dev flags"
     );
-    anyhow::ensure!(
-        choice == "sfu",
-        "only SFU signaling is available in this build"
-    );
+    anyhow::ensure!(choice == "sfu", "this build only supports the SFU route");
     let address = DevAddress::parse(address)?;
+    let file = Path::new(file);
     let profile: Profile =
         toml::from_str(&fs::read_to_string(file).context("reading lab profile")?)
             .map_err(|_| anyhow::anyhow!("invalid lab profile"))?;
-    let reply = timeout(Duration::from_secs(10), join(&address, profile))
+    let tls = profile
+        .test_ca
+        .as_ref()
+        .map(|ca| {
+            let base = file.parent().unwrap_or_else(|| Path::new("."));
+            test_connector(&base.join(ca))
+        })
+        .transpose()?;
+
+    let reply = timeout(EXCHANGE_TIMEOUT, join(&address, profile, tls.clone()))
         .await
         .context("Vox signaling timed out")??;
-    #[cfg(all(windows, feature = "desktop"))]
-    desktop::show(
-        address.authority(),
-        format!(
-            "Сигнализация подключена. Поколение комнаты {}. Медиа недоступно.",
+    #[cfg(all(windows, feature = "webrtc"))]
+    {
+        let connection = timeout(
+            EXCHANGE_TIMEOUT,
+            media::Connection::connect(&address, reply, tls),
+        )
+        .await
+        .context("ICE/DTLS setup timed out")??;
+        println!(
+            "DEV {} | SFU ICE/DTLS connected | media disabled",
+            address.authority()
+        );
+        #[cfg(feature = "desktop")]
+        {
+            let task = tokio::spawn(async move {
+                if let Err(error) = connection.maintain().await {
+                    eprintln!("Vox media transport closed: {error}");
+                }
+            });
+            desktop::show(
+                address.authority(),
+                "ICE/DTLS с SFU установлен. Передача медиа отключена.".into(),
+            );
+            task.abort();
+        }
+        #[cfg(not(feature = "desktop"))]
+        connection.maintain().await?;
+    }
+    #[cfg(not(all(windows, feature = "webrtc")))]
+    {
+        println!(
+            "DEV {} | signaling joined generation {} | media unavailable",
+            address.authority(),
             reply.generation
-        ),
-    );
-    #[cfg(not(all(windows, feature = "desktop")))]
-    println!(
-        "DEV {} | signaling joined generation {} | media unavailable",
-        address.authority(),
-        reply.generation
-    );
+        );
+        #[cfg(all(windows, feature = "desktop"))]
+        desktop::show(
+            address.authority(),
+            format!(
+                "Сигнализация подключена. Поколение комнаты {}. Медиа недоступно.",
+                reply.generation
+            ),
+        );
+    }
     Ok(())
 }
 
-async fn join(address: &DevAddress, profile: Profile) -> Result<RoomJoined> {
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME))
-        .max_frame_size(Some(MAX_FRAME));
-    let url = format!("wss://{}/v1/ws", address.authority());
-    let (mut socket, _) =
-        tokio_tungstenite::connect_async_with_config(url, Some(config), false).await?;
-    let hello = ClientHello {
-        min_minor: MINOR,
-        max_minor: MINOR,
-        capabilities: CAP_FRAME_E2EE,
-        required: CAP_FRAME_E2EE,
-    };
-    socket
-        .send(WsMessage::Binary(encode(MINOR, 1, &hello)?.into()))
-        .await?;
-    let bytes = receive_binary(&mut socket).await?;
-    let server_hello: ServerHello = response(&bytes, 1)?;
+fn test_connector(file: &Path) -> Result<Connector> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(
+        fs::File::open(file).context("opening test CA")?,
+    )) {
+        roots.add(cert?)?;
+    }
     anyhow::ensure!(
-        server_hello.minor == MINOR && server_hello.capabilities & CAP_FRAME_E2EE != 0,
-        "server did not negotiate mandatory E2EE"
+        !roots.is_empty(),
+        "test CA file does not contain certificates"
     );
+    Ok(Connector::Rustls(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )))
+}
+
+async fn join(
+    address: &DevAddress,
+    profile: Profile,
+    tls: Option<Connector>,
+) -> Result<RoomJoined> {
+    let mut socket = open(
+        format!("wss://{}/v1/ws", address.authority()),
+        tls,
+        CAP_FRAME_E2EE,
+    )
+    .await?;
     let join = JoinRoom {
         room: profile.room,
         device: profile.device,
         credential: profile.credential,
     };
-    socket
-        .send(WsMessage::Binary(encode(MINOR, 2, &join)?.into()))
-        .await?;
-    let bytes = receive_binary(&mut socket).await?;
-    response(&bytes, 2)
+    exchange(&mut socket, 2, &join).await
 }
 
-async fn receive_binary(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> Result<tungstenite::Bytes> {
+async fn open(url: String, tls: Option<Connector>, capabilities: u64) -> Result<Socket> {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME));
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async_tls_with_config(url, Some(config), true, tls).await?;
+    let hello = ClientHello {
+        min_minor: MINOR,
+        max_minor: MINOR,
+        capabilities,
+        required: capabilities,
+    };
+    let reply: ServerHello = exchange(&mut socket, 1, &hello).await?;
+    anyhow::ensure!(
+        reply.minor == MINOR && reply.capabilities & capabilities == capabilities,
+        "server did not negotiate required capabilities"
+    );
+    Ok(socket)
+}
+
+async fn exchange<M: Message, R: Message>(socket: &mut Socket, id: u64, request: &M) -> Result<R> {
+    socket
+        .send(WsMessage::Binary(encode(MINOR, id, request)?.into()))
+        .await?;
+    response(&receive_binary(socket).await?, id)
+}
+
+async fn receive_binary(socket: &mut Socket) -> Result<tungstenite::Bytes> {
     loop {
         match socket.next().await {
             Some(Ok(WsMessage::Binary(bytes))) => return Ok(bytes),
