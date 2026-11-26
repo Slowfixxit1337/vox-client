@@ -1,0 +1,12 @@
+name: Check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --check
+      - run: cargo test --locked --features lab
+      - run: cargo clippy --locked --all-targets --features lab -- -D warnings
+      - run: cargo check --locked --features lab,desktop,webrtc
+      - run: cargo test --locked --features webrtc --test native_webrtc
