@@ -22,6 +22,8 @@ mod desktop;
 mod media;
 #[cfg(all(windows, feature = "webrtc"))]
 mod voice;
+#[cfg(all(windows, feature = "lab", feature = "desktop"))]
+mod window_capture;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,6 +63,11 @@ impl VoiceProfile {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(all(windows, feature = "lab", feature = "desktop"))]
+    if args == ["--capture-preview"] {
+        desktop::capture_preview();
+        return Ok(());
+    }
     let [dev, server, address, lab, file, route, choice, audio @ ..] = args.as_slice() else {
         anyhow::bail!(
             "usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu [--audio tone|mic]"

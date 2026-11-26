@@ -10,7 +10,7 @@ publish = false
 [features]
 default = []
 lab = []
-desktop = ["dep:gpui-kit"]
+desktop = ["dep:gpui-kit", "dep:async-channel", "dep:image", "dep:raw-window-handle", "dep:windows"]
 webrtc = ["dep:libwebrtc"]
 
 [dependencies]
@@ -30,9 +30,26 @@ rustls-pemfile = "2"
 [dev-dependencies]
 tempfile = "3"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "=0.62.2", features = ["Win32_System_WinRT_Graphics_Capture", "Win32_UI_WindowsAndMessaging"] }
+
 [target.'cfg(windows)'.dependencies]
+async-channel = { version = "2.5", optional = true }
 gpui-kit = { version = "=0.11.0", default-features = false, features = ["component"], optional = true }
+image = { version = "0.25", default-features = false, optional = true }
 libwebrtc = { version = "=0.4.2", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+windows = { version = "=0.62.2", optional = true, features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Security_Authorization_AppCapabilityAccess",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_UI_Shell",
+] }
 
 [[bin]]
 name = "vox-lab"

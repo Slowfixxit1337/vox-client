@@ -7112,11 +7112,14 @@ name = "vox-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "futures-util",
  "gpui-kit",
  "hex",
+ "image",
  "libwebrtc",
  "rand 0.10.4",
+ "raw-window-handle",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -7126,6 +7129,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml 1.2.3+spec-1.1.0",
  "vox-protocol",
+ "windows 0.62.2",
 ]
 
 [[package]]
