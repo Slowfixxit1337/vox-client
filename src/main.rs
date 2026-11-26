@@ -21,6 +21,8 @@ mod desktop;
 #[cfg(all(windows, feature = "webrtc"))]
 mod media;
 #[cfg(all(windows, feature = "webrtc"))]
+mod video;
+#[cfg(all(windows, feature = "webrtc"))]
 mod voice;
 #[cfg(all(windows, feature = "lab", feature = "desktop"))]
 mod window_capture;
@@ -35,26 +37,27 @@ struct Profile {
     device: String,
     credential: String,
     test_ca: Option<PathBuf>,
-    voice: Option<VoiceProfile>,
+    voice: Option<MediaKeys>,
+    video: Option<MediaKeys>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct VoiceProfile {
+struct MediaKeys {
     send_key: String,
     receive_key: String,
 }
 
-impl VoiceProfile {
+impl MediaKeys {
     fn keys(&self) -> Result<([u8; 32], [u8; 32])> {
         let mut send = [0; 32];
         let mut receive = [0; 32];
-        hex::decode_to_slice(&self.send_key, &mut send).context("invalid voice send key")?;
+        hex::decode_to_slice(&self.send_key, &mut send).context("invalid media send key")?;
         hex::decode_to_slice(&self.receive_key, &mut receive)
-            .context("invalid voice receive key")?;
+            .context("invalid media receive key")?;
         anyhow::ensure!(
             send != [0; 32] && receive != [0; 32] && send != receive,
-            "voice needs distinct, nonzero directional keys"
+            "media needs distinct, nonzero directional keys"
         );
         Ok((send, receive))
     }
@@ -68,9 +71,9 @@ async fn main() -> Result<()> {
         desktop::capture_preview();
         return Ok(());
     }
-    let [dev, server, address, lab, file, route, choice, audio @ ..] = args.as_slice() else {
+    let [dev, server, address, lab, file, route, choice, options @ ..] = args.as_slice() else {
         anyhow::bail!(
-            "usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu [--audio tone|mic]"
+            "usage: vox-client --dev --server HOST[:PORT] --lab FILE --media-route sfu [--audio tone|mic] [--video test]"
         );
     };
     anyhow::ensure!(
@@ -82,13 +85,26 @@ async fn main() -> Result<()> {
         "this command requires the lab feature and explicit dev flags"
     );
     anyhow::ensure!(choice == "sfu", "this build only supports the SFU route");
-    let audio = match audio {
-        [] => None,
-        [flag, mode] if flag == "--audio" && matches!(mode.as_str(), "tone" | "mic") => {
-            Some(mode.as_str())
-        }
-        _ => anyhow::bail!("expected [--audio tone|mic]"),
-    };
+    let mut audio = None;
+    let mut video = false;
+    let mut options = options;
+    while !options.is_empty() {
+        options = match options {
+            [flag, mode, tail @ ..]
+                if flag == "--audio"
+                    && audio.is_none()
+                    && matches!(mode.as_str(), "tone" | "mic") =>
+            {
+                audio = Some(mode.as_str());
+                tail
+            }
+            [flag, mode, tail @ ..] if flag == "--video" && mode == "test" && !video => {
+                video = true;
+                tail
+            }
+            _ => anyhow::bail!("expected [--audio tone|mic] [--video test]"),
+        };
+    }
     let address = DevAddress::parse(address)?;
     let file = Path::new(file);
     let profile: Profile =
@@ -100,6 +116,19 @@ async fn main() -> Result<()> {
         .map(|ca| {
             let base = file.parent().unwrap_or_else(|| Path::new("."));
             test_connector(&base.join(ca))
+        })
+        .transpose()?;
+    let video_keys = video
+        .then(|| {
+            anyhow::ensure!(
+                cfg!(all(windows, feature = "webrtc")),
+                "video requires native WebRTC"
+            );
+            profile
+                .video
+                .as_ref()
+                .context("test video needs vox-lab init --video")?
+                .keys()
         })
         .transpose()?;
     let voice_keys = audio
@@ -141,6 +170,11 @@ async fn main() -> Result<()> {
                         receive,
                         a_side,
                     }),
+                video_keys.map(|(send, receive)| video::Settings {
+                    send,
+                    receive,
+                    a_side,
+                }),
             ),
         )
         .await
@@ -148,11 +182,18 @@ async fn main() -> Result<()> {
         println!(
             "DEV {} | SFU ICE/DTLS connected | {}",
             address.authority(),
-            audio.map_or("media disabled", |mode| if mode == "mic" {
-                "E2EE microphone"
-            } else {
-                "E2EE test tone"
-            }),
+            audio.map_or(
+                if video {
+                    "E2EE VP8 test video"
+                } else {
+                    "media disabled"
+                },
+                |mode| if mode == "mic" {
+                    "E2EE microphone"
+                } else {
+                    "E2EE test tone"
+                }
+            ),
         );
         #[cfg(feature = "desktop")]
         {
@@ -163,7 +204,9 @@ async fn main() -> Result<()> {
             });
             desktop::show(
                 address.authority(),
-                if audio.is_some() {
+                if video {
+                    "ICE/DTLS с SFU установлен. Лабораторное видео VP8 с E2EE."
+                } else if audio.is_some() {
                     "ICE/DTLS с SFU установлен. Лабораторный аудиорежим E2EE."
                 } else {
                     "ICE/DTLS с SFU установлен. Передача медиа отключена."
@@ -178,6 +221,7 @@ async fn main() -> Result<()> {
     #[cfg(not(all(windows, feature = "webrtc")))]
     {
         debug_assert!(voice_keys.is_none());
+        debug_assert!(video_keys.is_none());
         println!(
             "DEV {} | signaling joined generation {} | media unavailable",
             address.authority(),

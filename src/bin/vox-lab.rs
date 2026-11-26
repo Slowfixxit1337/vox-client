@@ -11,11 +11,13 @@ struct ClientProfile<'a> {
     device: &'a str,
     credential: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    voice: Option<VoiceProfile<'a>>,
+    voice: Option<MediaKeys<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video: Option<MediaKeys<'a>>,
 }
 
 #[derive(Serialize)]
-struct VoiceProfile<'a> {
+struct MediaKeys<'a> {
     send_key: &'a str,
     receive_key: &'a str,
 }
@@ -31,7 +33,9 @@ struct AdmissionFile<'a> {
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [verb, flag, path, rest @ ..] = args.as_slice() else {
-        anyhow::bail!("usage: vox-lab init --out NEW_DIRECTORY [--sfu-url WSS_URL] [--voice]");
+        anyhow::bail!(
+            "usage: vox-lab init --out NEW_DIRECTORY [--sfu-url WSS_URL] [--voice] [--video]"
+        );
     };
     anyhow::ensure!(
         verb == "init" && flag == "--out",
@@ -40,6 +44,7 @@ fn main() -> Result<()> {
     let mut options = rest;
     let mut sfu_url = None;
     let mut voice = false;
+    let mut video = false;
     while !options.is_empty() {
         options = match options {
             [flag, value, tail @ ..] if flag == "--sfu-url" && sfu_url.is_none() => {
@@ -50,7 +55,11 @@ fn main() -> Result<()> {
                 voice = true;
                 tail
             }
-            _ => anyhow::bail!("expected [--sfu-url WSS_URL] [--voice]"),
+            [flag, tail @ ..] if flag == "--video" && !video => {
+                video = true;
+                tail
+            }
+            _ => anyhow::bail!("expected [--sfu-url WSS_URL] [--voice] [--video]"),
         };
     }
     let sfu_url =
@@ -58,6 +67,11 @@ fn main() -> Result<()> {
     let path = Path::new(path);
     fs::create_dir(path).context("the output directory must be new")?;
     let voice_keys = if voice {
+        Some([random_secret()?, random_secret()?])
+    } else {
+        None
+    };
+    let video_keys = if video {
         Some([random_secret()?, random_secret()?])
     } else {
         None
@@ -72,7 +86,11 @@ fn main() -> Result<()> {
                 room: "media",
                 device,
                 credential,
-                voice: voice_keys.as_ref().map(|keys| VoiceProfile {
+                voice: voice_keys.as_ref().map(|keys| MediaKeys {
+                    send_key: &keys[local],
+                    receive_key: &keys[1 - local],
+                }),
+                video: video_keys.as_ref().map(|keys| MediaKeys {
                     send_key: &keys[local],
                     receive_key: &keys[1 - local],
                 }),

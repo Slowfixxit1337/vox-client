@@ -9,7 +9,7 @@ use libwebrtc::{
     rtp_transceiver::{RtpTransceiverDirection, RtpTransceiverInit},
     session_description::{SdpType, SessionDescription},
 };
-use std::time::Duration;
+use std::{future::pending, time::Duration};
 use tokio::{
     sync::mpsc,
     time::{self, timeout},
@@ -22,7 +22,7 @@ use vox_protocol::{
 };
 
 use super::{EXCHANGE_TIMEOUT, Socket, exchange, open};
-use crate::voice;
+use crate::{video, voice};
 
 pub struct Connection {
     socket: Socket,
@@ -33,6 +33,7 @@ pub struct Connection {
     bundled_mid: Option<String>,
     receiver_guard: Option<FrameCryptor>,
     voice: Option<voice::Session>,
+    video: Option<video::Session>,
 }
 
 impl Connection {
@@ -41,10 +42,18 @@ impl Connection {
         room: RoomJoined,
         tls: Option<Connector>,
         voice_settings: Option<voice::Settings>,
+        video_settings: Option<video::Settings>,
     ) -> Result<Self> {
         ensure!(
             voice_settings.is_none() || room.allowed_tracks.contains(&vox_protocol::Track::Mic),
             "ticket does not allow a microphone track"
+        );
+        ensure!(
+            video_settings.is_none()
+                || room
+                    .allowed_tracks
+                    .contains(&vox_protocol::Track::ShareVideo),
+            "ticket does not allow ShareVideo"
         );
         let url = address.verified_sfu_url(&room.sfu_url)?;
         let socket = open(url, tls, CAP_FRAME_E2EE | CAP_SFU_TRANSPORT).await?;
@@ -89,9 +98,11 @@ impl Connection {
             bundled_mid: None,
             receiver_guard: None,
             voice: None,
+            video: None,
         };
 
         let mut voice_settings = voice_settings;
+        let mut video_settings = video_settings;
         for (index, kind) in [
             MediaType::Audio,
             MediaType::Video,
@@ -101,6 +112,16 @@ impl Connection {
         .into_iter()
         .enumerate()
         {
+            if index == 1
+                && let Some(settings) = video_settings.take()
+            {
+                connection.video = Some(video::Session::prepare(
+                    &factory,
+                    &connection.peer,
+                    settings,
+                )?);
+                continue;
+            }
             if index == 0
                 && let Some(settings) = voice_settings.take()
             {
@@ -197,13 +218,22 @@ impl Connection {
     }
 
     pub async fn maintain(mut self) -> Result<()> {
-        if let Some(mut voice) = self.voice.take() {
-            tokio::select! {
-                transport = self.maintain_transport() => transport,
-                audio = voice.run() => audio,
-            }
-        } else {
-            self.maintain_transport().await
+        let mut voice = self.voice.take();
+        let mut video = self.video.take();
+        tokio::select! {
+            transport = self.maintain_transport() => transport,
+            audio = async {
+                match &mut voice {
+                    Some(voice) => voice.run().await,
+                    None => pending().await,
+                }
+            } => audio,
+            share_video = async {
+                match &mut video {
+                    Some(video) => video.run().await,
+                    None => pending().await,
+                }
+            } => share_video,
         }
     }
 
