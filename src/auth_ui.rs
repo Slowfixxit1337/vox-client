@@ -97,6 +97,8 @@ struct Verification {
 enum Screen {
     SignIn,
     Registration,
+    RequestPasswordReset,
+    ResetPassword,
     Confirmation(Verification),
     Friends(Session),
 }
@@ -105,6 +107,8 @@ enum Screen {
 enum Request {
     Register,
     SignIn,
+    SendResetLink,
+    ResetPassword,
     Confirm,
     Resend,
     Resume,
@@ -121,6 +125,8 @@ struct AuthView {
     username: Entity<InputState>,
     email: Entity<InputState>,
     password: Entity<InputState>,
+    reset_email: Entity<InputState>,
+    reset_link: Entity<InputState>,
     otp: Entity<OtpState>,
     busy: bool,
     status: Option<&'static str>,
@@ -132,6 +138,12 @@ impl AuthView {
         let login = cx.new(|cx| InputState::new(window, cx).placeholder("Login"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Login"));
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("Mail"));
+        let reset_email = cx.new(|cx| InputState::new(window, cx).placeholder("Email"));
+        let reset_link = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Paste reset link")
+                .masked(true)
+        });
         let password = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Password")
@@ -140,6 +152,11 @@ impl AuthView {
         let otp = cx.new(|cx| OtpState::new(6, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&password, window, |view, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    view.submit(window, cx);
+                }
+            }),
+            cx.subscribe_in(&reset_email, window, |view, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     view.submit(window, cx);
                 }
@@ -186,6 +203,8 @@ impl AuthView {
             username,
             email,
             password,
+            reset_email,
+            reset_link,
             otp,
             busy: false,
             status: None,
@@ -197,6 +216,10 @@ impl AuthView {
         match &self.screen {
             Screen::SignIn => self.login.read(cx).focus_handle(cx).focus(window, cx),
             Screen::Registration => self.username.read(cx).focus_handle(cx).focus(window, cx),
+            Screen::RequestPasswordReset => {
+                self.reset_email.read(cx).focus_handle(cx).focus(window, cx)
+            }
+            Screen::ResetPassword => self.reset_link.read(cx).focus_handle(cx).focus(window, cx),
             Screen::Confirmation(verification) if verification.confirmed.is_none() => {
                 self.otp.update(cx, |otp, cx| otp.focus(window, cx));
             }
@@ -209,6 +232,8 @@ impl AuthView {
         self.status = None;
         self.password
             .update(cx, |password, cx| password.set_value("", window, cx));
+        self.reset_link
+            .update(cx, |link, cx| link.set_value("", window, cx));
         self.focus(window, cx);
         cx.notify();
     }
@@ -379,6 +404,47 @@ impl AuthView {
                     cx,
                 );
             }
+            Screen::RequestPasswordReset => {
+                let email = self.reset_email.read(cx).value().trim().to_owned();
+                if email.is_empty() {
+                    self.status = Some("Enter your email address.");
+                    cx.notify();
+                    return;
+                }
+                self.send(
+                    Request::SendResetLink,
+                    Operation::RequestPasswordReset { email },
+                    window,
+                    cx,
+                );
+            }
+            Screen::ResetPassword => {
+                let link = self.reset_link.read(cx).value();
+                let token = link.trim().strip_prefix("vox://reset/").filter(|token| {
+                    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                let Some(token) = token else {
+                    self.status = Some("Paste the full reset link from your email.");
+                    cx.notify();
+                    return;
+                };
+                let password = self.password.read(cx).value().to_string();
+                if !(8..=128).contains(&password.len()) || password.chars().any(char::is_control) {
+                    self.status =
+                        Some("Enter a password of 8 to 128 bytes without control characters.");
+                    cx.notify();
+                    return;
+                }
+                self.send(
+                    Request::ResetPassword,
+                    Operation::ResetPassword {
+                        token: token.to_ascii_lowercase(),
+                        password,
+                    },
+                    window,
+                    cx,
+                );
+            }
             Screen::Friends(_) => {}
         }
     }
@@ -429,6 +495,22 @@ impl AuthView {
         cx: &mut Context<Self>,
     ) {
         match (request, outcome) {
+            (Request::SendResetLink, Outcome::PasswordResetRequested) => {
+                self.switch(Screen::ResetPassword, window, cx);
+            }
+            (Request::ResetPassword, Outcome::PasswordReset) => {
+                self.switch(Screen::SignIn, window, cx);
+                self.status = Some("Password changed. Sign in with your new password.");
+            }
+            (
+                Request::ResetPassword,
+                Outcome::Rejected {
+                    code: AuthError::InvalidCode,
+                    ..
+                },
+            ) => {
+                self.status = Some("This reset link is expired or has already been used.");
+            }
             (
                 Request::Register | Request::SignIn | Request::Resend,
                 Outcome::VerificationRequired {
@@ -574,9 +656,8 @@ impl AuthView {
                     div().flex().justify_end().mt(px(12.)).child(
                         link("forgot-password", "Forgot password?", self.busy)
                             .text_color(rgb(MUTED))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.status = Some("Password recovery is not available yet.");
-                                cx.notify();
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.switch(Screen::RequestPasswordReset, window, cx);
                             })),
                     ),
                 )
@@ -640,6 +721,100 @@ impl AuthView {
             body.mt(px(40.)).into_any_element(),
             footer.into_any_element(),
             None,
+        )
+    }
+
+    fn password_recovery(&self, has_link: bool, cx: &mut Context<Self>) -> AnyElement {
+        let body = if has_link {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(16.))
+                .child(field(
+                    &self.reset_link,
+                    "Reset link",
+                    InputContentType::Password,
+                    MAIL_ICON,
+                    self.busy,
+                ))
+                .child(field(
+                    &self.password,
+                    "New password",
+                    InputContentType::NewPassword,
+                    PASSWORD_ICON,
+                    self.busy,
+                ))
+        } else {
+            div().child(field(
+                &self.reset_email,
+                "Email",
+                InputContentType::EmailAddress,
+                MAIL_ICON,
+                self.busy,
+            ))
+        };
+        let footer = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                primary(
+                    "password-recovery-action",
+                    if has_link {
+                        "Reset password"
+                    } else {
+                        "Send reset link"
+                    },
+                    self.busy,
+                )
+                .on_click(cx.listener(|view, _, window, cx| view.submit(window, cx))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(
+                        link("password-recovery-back", "Back to sign in", self.busy).on_click(
+                            cx.listener(|view, _, window, cx| {
+                                view.switch(Screen::SignIn, window, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        link(
+                            "password-recovery-switch",
+                            if has_link {
+                                "Request a new link"
+                            } else {
+                                "I have a reset link"
+                            },
+                            self.busy,
+                        )
+                        .on_click(cx.listener(
+                            move |view, _, window, cx| {
+                                view.switch(
+                                    if has_link {
+                                        Screen::RequestPasswordReset
+                                    } else {
+                                        Screen::ResetPassword
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )),
+                    ),
+            );
+        self.layout(
+            "Reset password",
+            LOGO,
+            body.mt(px(24.)).into_any_element(),
+            footer.into_any_element(),
+            Some(SharedString::from(if has_link {
+                "If an account exists, we’ll email a link. Paste it here."
+            } else {
+                "Use the email address linked to your account."
+            })),
         )
     }
 
@@ -861,6 +1036,8 @@ impl Render for AuthView {
         match &self.screen {
             Screen::SignIn => self.credentials(false, cx),
             Screen::Registration => self.credentials(true, cx),
+            Screen::RequestPasswordReset => self.password_recovery(false, cx),
+            Screen::ResetPassword => self.password_recovery(true, cx),
             Screen::Confirmation(verification) => self.confirmation(verification, window, cx),
             Screen::Friends(session) => self.friends(session, cx),
         }

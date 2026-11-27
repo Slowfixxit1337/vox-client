@@ -7136,7 +7136,7 @@ dependencies = [
 [[package]]
 name = "vox-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=fd87785f44da6565b2b362ac5f16705ff18dd325#fd87785f44da6565b2b362ac5f16705ff18dd325"
+source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=3cd5384ac72ef76c70fae758a86895b7ee69bcfd#3cd5384ac72ef76c70fae758a86895b7ee69bcfd"
 dependencies = [
  "postcard",
  "serde",

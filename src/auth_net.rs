@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::Connector;
 use vox_client::DevAddress;
 use vox_protocol::{
-    CAP_AUTH, CAP_FRAME_E2EE,
+    CAP_AUTH, CAP_FRAME_E2EE, CAP_PASSWORD_RESET,
     auth::{AuthReply, AuthRequest, Operation, Outcome},
 };
 use windows::{
@@ -82,10 +82,14 @@ impl Client {
 
     pub async fn call(&self, operation: Operation) -> Result<Outcome> {
         timeout(AUTH_TIMEOUT, async {
+            let mut capabilities = CAP_FRAME_E2EE | CAP_AUTH;
+            if operation.requires_password_reset() {
+                capabilities |= CAP_PASSWORD_RESET;
+            }
             let mut socket = super::open(
                 format!("wss://{}/v1/auth", self.address.authority()),
                 self.tls.clone(),
-                CAP_FRAME_E2EE | CAP_AUTH,
+                capabilities,
             )
             .await?;
             let result: AuthReply =
@@ -375,7 +379,7 @@ mod tests {
         ));
         client.clear_session()?;
         assert!(client.saved_session()?.is_none());
-        for login in [username, email] {
+        for login in [username.clone(), email.clone()] {
             assert!(matches!(
                 client
                     .call(Operation::SignIn {
@@ -386,6 +390,54 @@ mod tests {
                 Outcome::Authenticated { .. }
             ));
         }
+        assert!(matches!(
+            client
+                .call(Operation::RequestPasswordReset {
+                    email: email.clone()
+                })
+                .await?,
+            Outcome::PasswordResetRequested
+        ));
+        let token = timeout(Duration::from_secs(7), async {
+            let recipient = format!("To: {email}");
+            loop {
+                for entry in fs::read_dir(&outbox)? {
+                    let entry = entry?;
+                    if entry.path().extension().is_some_and(|ext| ext == "txt") {
+                        let message = fs::read_to_string(entry.path())?;
+                        if message.lines().any(|line| line == recipient)
+                            && let Some(token) = message
+                                .lines()
+                                .find_map(|line| line.strip_prefix("vox://reset/"))
+                        {
+                            return Ok::<_, anyhow::Error>(token.to_owned());
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+        })
+        .await
+        .context("password reset email was not written")??;
+        let replacement = "replacement-only-for-vox-auth-smoke";
+        assert!(matches!(
+            client
+                .call(Operation::ResetPassword {
+                    token,
+                    password: replacement.into()
+                })
+                .await?,
+            Outcome::PasswordReset
+        ));
+        assert!(matches!(
+            client
+                .call(Operation::SignIn {
+                    login: username,
+                    password: replacement.into()
+                })
+                .await?,
+            Outcome::Authenticated { .. }
+        ));
         Ok(())
     }
 }
