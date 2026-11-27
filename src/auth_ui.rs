@@ -78,6 +78,7 @@ pub fn show(client: Client) {
     });
 }
 
+#[derive(Clone)]
 struct Session {
     username: String,
     token: String,
@@ -101,6 +102,7 @@ enum Screen {
     ResetPassword,
     Confirmation(Verification),
     Friends(Session),
+    AccountSettings(Session),
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +111,7 @@ enum Request {
     SignIn,
     SendResetLink,
     ResetPassword,
+    ChangePassword,
     Confirm,
     Resend,
     Resume,
@@ -125,6 +128,8 @@ struct AuthView {
     username: Entity<InputState>,
     email: Entity<InputState>,
     password: Entity<InputState>,
+    current_password: Entity<InputState>,
+    confirm_password: Entity<InputState>,
     reset_email: Entity<InputState>,
     reset_link: Entity<InputState>,
     otp: Entity<OtpState>,
@@ -149,9 +154,26 @@ impl AuthView {
                 .placeholder("Password")
                 .masked(true)
         });
+        let current_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Current password")
+                .masked(true)
+        });
+        let confirm_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Confirm new password")
+                .masked(true)
+        });
         let otp = cx.new(|cx| OtpState::new(6, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&password, window, |view, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !matches!(view.screen, Screen::AccountSettings(_))
+                {
+                    view.submit(window, cx);
+                }
+            }),
+            cx.subscribe_in(&confirm_password, window, |view, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     view.submit(window, cx);
                 }
@@ -203,6 +225,8 @@ impl AuthView {
             username,
             email,
             password,
+            current_password,
+            confirm_password,
             reset_email,
             reset_link,
             otp,
@@ -216,6 +240,11 @@ impl AuthView {
         match &self.screen {
             Screen::SignIn => self.login.read(cx).focus_handle(cx).focus(window, cx),
             Screen::Registration => self.username.read(cx).focus_handle(cx).focus(window, cx),
+            Screen::AccountSettings(_) => self
+                .current_password
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx),
             Screen::RequestPasswordReset => {
                 self.reset_email.read(cx).focus_handle(cx).focus(window, cx)
             }
@@ -231,6 +260,10 @@ impl AuthView {
         self.screen = screen;
         self.status = None;
         self.password
+            .update(cx, |password, cx| password.set_value("", window, cx));
+        self.current_password
+            .update(cx, |password, cx| password.set_value("", window, cx));
+        self.confirm_password
             .update(cx, |password, cx| password.set_value("", window, cx));
         self.reset_link
             .update(cx, |link, cx| link.set_value("", window, cx));
@@ -325,6 +358,15 @@ impl AuthView {
                         ..
                     },
                 ) => client.clear_session()?,
+                (
+                    Request::ChangePassword,
+                    Outcome::Rejected {
+                        code: AuthError::SessionExpired,
+                        ..
+                    },
+                ) => {
+                    client.clear_session()?;
+                }
                 _ => {}
             }
             Ok(Some(outcome))
@@ -445,6 +487,39 @@ impl AuthView {
                     cx,
                 );
             }
+            Screen::AccountSettings(session) => {
+                let current_password = self.current_password.read(cx).value().to_string();
+                let new_password = self.password.read(cx).value().to_string();
+                let confirmation = self.confirm_password.read(cx).value();
+                let error = if current_password.is_empty() {
+                    Some("Enter your current password.")
+                } else if !(8..=128).contains(&new_password.len())
+                    || new_password.chars().any(char::is_control)
+                {
+                    Some("Enter a password of 8 to 128 bytes without control characters.")
+                } else if new_password != confirmation.as_ref() {
+                    Some("The new passwords do not match.")
+                } else if new_password == current_password {
+                    Some("Choose a different new password.")
+                } else {
+                    None
+                };
+                if let Some(message) = error {
+                    self.status = Some(message);
+                    cx.notify();
+                    return;
+                }
+                self.send(
+                    Request::ChangePassword,
+                    Operation::ChangePassword {
+                        session: session.token.clone(),
+                        current_password,
+                        new_password,
+                    },
+                    window,
+                    cx,
+                );
+            }
             Screen::Friends(_) => {}
         }
     }
@@ -495,6 +570,34 @@ impl AuthView {
         cx: &mut Context<Self>,
     ) {
         match (request, outcome) {
+            (Request::ChangePassword, Outcome::PasswordChanged) => {
+                if let Screen::AccountSettings(session) = &self.screen {
+                    self.switch(Screen::Friends(session.clone()), window, cx);
+                    self.status = Some("Password changed. Other sessions were signed out.");
+                }
+            }
+            (
+                Request::ChangePassword,
+                Outcome::Rejected {
+                    code: AuthError::SessionExpired,
+                    ..
+                },
+            ) => {
+                self.switch(Screen::SignIn, window, cx);
+                self.status = Some(error_text(AuthError::SessionExpired));
+            }
+            (
+                Request::ChangePassword,
+                Outcome::Rejected {
+                    code: AuthError::InvalidCredentials,
+                    ..
+                },
+            ) => {
+                self.status = Some("The current password is incorrect.");
+                self.current_password
+                    .update(cx, |password, cx| password.set_value("", window, cx));
+                self.focus(window, cx);
+            }
             (Request::SendResetLink, Outcome::PasswordResetRequested) => {
                 self.switch(Screen::ResetPassword, window, cx);
             }
@@ -959,11 +1062,74 @@ impl AuthView {
                 .mt(px(40.))
                 .text_center()
                 .child("No friends yet.")
+                .child(div().mt(px(20.)).child(
+                    link("account-settings", "Account settings", self.busy).on_click(cx.listener(
+                        |view, _, window, cx| {
+                            if let Screen::Friends(session) = &view.screen {
+                                view.switch(Screen::AccountSettings(session.clone()), window, cx);
+                            }
+                        },
+                    )),
+                ))
                 .into_any_element(),
             primary("sign-out", "Sign out", self.busy)
                 .on_click(cx.listener(|view, _, window, cx| view.sign_out(window, cx)))
                 .into_any_element(),
             Some(account.into()),
+        )
+    }
+
+    fn account_settings(&self, session: &Session, cx: &mut Context<Self>) -> AnyElement {
+        let body = div()
+            .mt(px(30.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(field(
+                &self.current_password,
+                "Current password",
+                InputContentType::Password,
+                PASSWORD_ICON,
+                self.busy,
+            ))
+            .child(field(
+                &self.password,
+                "New password",
+                InputContentType::NewPassword,
+                PASSWORD_ICON,
+                self.busy,
+            ))
+            .child(field(
+                &self.confirm_password,
+                "Confirm new password",
+                InputContentType::NewPassword,
+                PASSWORD_ICON,
+                self.busy,
+            ));
+        let footer = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .items_center()
+            .child(
+                primary("change-password", "Change password", self.busy)
+                    .on_click(cx.listener(|view, _, window, cx| view.submit(window, cx))),
+            )
+            .child(
+                link("account-settings-back", "Back to Friends", self.busy).on_click(cx.listener(
+                    |view, _, window, cx| {
+                        if let Screen::AccountSettings(session) = &view.screen {
+                            view.switch(Screen::Friends(session.clone()), window, cx);
+                        }
+                    },
+                )),
+            );
+        self.layout(
+            "Account settings",
+            LOGO,
+            body.into_any_element(),
+            footer.into_any_element(),
+            Some(format!("@{}", session.username).into()),
         )
     }
 
@@ -1040,6 +1206,7 @@ impl Render for AuthView {
             Screen::ResetPassword => self.password_recovery(true, cx),
             Screen::Confirmation(verification) => self.confirmation(verification, window, cx),
             Screen::Friends(session) => self.friends(session, cx),
+            Screen::AccountSettings(session) => self.account_settings(session, cx),
         }
     }
 }

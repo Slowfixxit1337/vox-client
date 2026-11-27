@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::Connector;
 use vox_client::DevAddress;
 use vox_protocol::{
-    CAP_AUTH, CAP_FRAME_E2EE, CAP_PASSWORD_RESET,
+    CAP_AUTH, CAP_FRAME_E2EE,
     auth::{AuthReply, AuthRequest, Operation, Outcome},
 };
 use windows::{
@@ -82,10 +82,7 @@ impl Client {
 
     pub async fn call(&self, operation: Operation) -> Result<Outcome> {
         timeout(AUTH_TIMEOUT, async {
-            let mut capabilities = CAP_FRAME_E2EE | CAP_AUTH;
-            if operation.requires_password_reset() {
-                capabilities |= CAP_PASSWORD_RESET;
-            }
+            let capabilities = CAP_FRAME_E2EE | CAP_AUTH | operation.required_capability();
             let mut socket = super::open(
                 format!("wss://{}/v1/auth", self.address.authority()),
                 self.tls.clone(),
@@ -429,13 +426,49 @@ mod tests {
                 .await?,
             Outcome::PasswordReset
         ));
+        let sign_in = |password: &str| Operation::SignIn {
+            login: username.clone(),
+            password: password.into(),
+        };
+        let Outcome::Authenticated {
+            session: active, ..
+        } = client.call(sign_in(replacement)).await?
+        else {
+            anyhow::bail!("reset password did not work over WSS");
+        };
+        let Outcome::Authenticated { session: other, .. } =
+            client.call(sign_in(replacement)).await?
+        else {
+            anyhow::bail!("could not start second session over WSS");
+        };
+        let changed = "changed-only-for-vox-auth-smoke";
         assert!(matches!(
             client
-                .call(Operation::SignIn {
-                    login: username,
-                    password: replacement.into()
+                .call(Operation::ChangePassword {
+                    session: active.clone(),
+                    current_password: replacement.into(),
+                    new_password: changed.into(),
                 })
                 .await?,
+            Outcome::PasswordChanged
+        ));
+        assert!(matches!(
+            client
+                .call(Operation::ResumeSession { session: active })
+                .await?,
+            Outcome::Authenticated { .. }
+        ));
+        assert!(matches!(
+            client
+                .call(Operation::ResumeSession { session: other })
+                .await?,
+            Outcome::Rejected {
+                code: AuthError::SessionExpired,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client.call(sign_in(changed)).await?,
             Outcome::Authenticated { .. }
         ));
         Ok(())
