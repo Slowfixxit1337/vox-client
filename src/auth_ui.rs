@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
-use vox_protocol::auth::{AuthError, Operation, Outcome};
+use vox_protocol::auth::{AuthError, Operation, Outcome, TwoFactorAction};
 
 mod two_factor;
 const BACKGROUND: u32 = 0x020617;
@@ -105,6 +105,8 @@ enum Screen {
     Friends(Session),
     AccountSettings(Session),
     FactorSettings(Session),
+    FactorOverview(Session, u32),
+    FactorManage(Session, TwoFactorAction),
     FactorSetup(Session, String),
     FactorBackupCodes(Session, Vec<String>),
     FactorSignIn(String),
@@ -120,6 +122,8 @@ enum Request {
     BeginTwoFactor,
     ConfirmTwoFactor,
     CompleteTwoFactor,
+    ReadTwoFactor,
+    ManageTwoFactor,
     Confirm,
     Resend,
     Resume,
@@ -260,11 +264,12 @@ impl AuthView {
         match &self.screen {
             Screen::SignIn => self.login.read(cx).focus_handle(cx).focus(window, cx),
             Screen::Registration => self.username.read(cx).focus_handle(cx).focus(window, cx),
-            Screen::AccountSettings(_) | Screen::FactorSettings(_) => self
-                .current_password
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window, cx),
+            Screen::AccountSettings(_) | Screen::FactorSettings(_) | Screen::FactorManage(..) => {
+                self.current_password
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx)
+            }
             Screen::FactorSetup(..) | Screen::FactorSignIn(_) => {
                 self.factor_code.read(cx).focus_handle(cx).focus(window, cx)
             }
@@ -385,7 +390,11 @@ impl AuthView {
                     },
                 ) => client.clear_session()?,
                 (
-                    Request::ChangePassword | Request::BeginTwoFactor | Request::ConfirmTwoFactor,
+                    Request::ChangePassword
+                    | Request::BeginTwoFactor
+                    | Request::ConfirmTwoFactor
+                    | Request::ReadTwoFactor
+                    | Request::ManageTwoFactor,
                     Outcome::Rejected {
                         code: AuthError::SessionExpired,
                         ..
@@ -546,10 +555,11 @@ impl AuthView {
                     cx,
                 );
             }
-            Screen::FactorSettings(_) | Screen::FactorSetup(..) | Screen::FactorSignIn(_) => {
-                self.submit_two_factor(window, cx)
-            }
-            Screen::Friends(_) | Screen::FactorBackupCodes(..) => {}
+            Screen::FactorSettings(_)
+            | Screen::FactorSetup(..)
+            | Screen::FactorSignIn(_)
+            | Screen::FactorManage(..) => self.submit_two_factor(window, cx),
+            Screen::Friends(_) | Screen::FactorBackupCodes(..) | Screen::FactorOverview(..) => {}
         }
     }
 
@@ -599,6 +609,37 @@ impl AuthView {
         cx: &mut Context<Self>,
     ) {
         match (request, outcome) {
+            (
+                Request::ReadTwoFactor,
+                Outcome::TwoFactorStatus {
+                    enabled,
+                    backup_codes_left,
+                },
+            ) => {
+                if let Screen::AccountSettings(session) = &self.screen {
+                    let screen = if enabled {
+                        Screen::FactorOverview(session.clone(), backup_codes_left)
+                    } else {
+                        Screen::FactorSettings(session.clone())
+                    };
+                    self.switch(screen, window, cx);
+                }
+            }
+            (Request::ManageTwoFactor, Outcome::TwoFactorDisabled) => {
+                if let Screen::FactorManage(session, _) = &self.screen {
+                    self.switch(Screen::FactorSettings(session.clone()), window, cx);
+                    self.status = Some("Two-factor authentication is disabled.");
+                }
+            }
+            (Request::ManageTwoFactor, Outcome::TwoFactorEnabled { backup_codes }) => {
+                if let Screen::FactorManage(session, _) = &self.screen {
+                    self.switch(
+                        Screen::FactorBackupCodes(session.clone(), backup_codes),
+                        window,
+                        cx,
+                    );
+                }
+            }
             (Request::SignIn, Outcome::TwoFactorRequired { challenge, .. }) => {
                 self.switch(Screen::FactorSignIn(challenge), window, cx);
             }
@@ -617,7 +658,10 @@ impl AuthView {
                 }
             }
             (
-                Request::BeginTwoFactor | Request::ConfirmTwoFactor,
+                Request::BeginTwoFactor
+                | Request::ConfirmTwoFactor
+                | Request::ReadTwoFactor
+                | Request::ManageTwoFactor,
                 Outcome::Rejected {
                     code: AuthError::SessionExpired,
                     ..
@@ -1185,7 +1229,14 @@ impl AuthView {
                 link("open-two-factor", "Two-factor authentication", self.busy).on_click(
                     cx.listener(|view, _, window, cx| {
                         if let Screen::AccountSettings(session) = &view.screen {
-                            view.switch(Screen::FactorSettings(session.clone()), window, cx);
+                            view.send(
+                                Request::ReadTwoFactor,
+                                Operation::GetTwoFactorStatus {
+                                    session: session.token.clone(),
+                                },
+                                window,
+                                cx,
+                            );
                         }
                     }),
                 ),
@@ -1283,6 +1334,8 @@ impl Render for AuthView {
             Screen::Friends(session) => self.friends(session, cx),
             Screen::AccountSettings(session) => self.account_settings(session, cx),
             Screen::FactorSettings(_)
+            | Screen::FactorOverview(..)
+            | Screen::FactorManage(..)
             | Screen::FactorSetup(..)
             | Screen::FactorBackupCodes(..)
             | Screen::FactorSignIn(_) => self.render_two_factor(cx),

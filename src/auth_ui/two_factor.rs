@@ -18,16 +18,16 @@ impl AuthView {
                     },
                 )
             }
-            Screen::FactorSetup(..) | Screen::FactorSignIn(_) => {
+            Screen::FactorSetup(..) | Screen::FactorSignIn(_) | Screen::FactorManage(..) => {
                 let code = self.factor_code.read(cx).value().trim().to_owned();
                 let authenticator_code =
                     code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit());
-                let is_sign_in = matches!(self.screen, Screen::FactorSignIn(_));
-                let backup_code = is_sign_in
+                let accepts_backup = !matches!(self.screen, Screen::FactorSetup(..));
+                let backup_code = accepts_backup
                     && code.len() == 20
                     && code.bytes().all(|byte| byte.is_ascii_hexdigit());
                 if !authenticator_code && !backup_code {
-                    self.status = Some(if is_sign_in {
+                    self.status = Some(if accepts_backup {
                         "Enter an authenticator code or a backup code."
                     } else {
                         "Enter the six-digit authenticator code."
@@ -50,6 +50,23 @@ impl AuthView {
                             code,
                         },
                     ),
+                    Screen::FactorManage(session, action) => {
+                        let password = self.current_password.read(cx).value().to_string();
+                        if password.is_empty() {
+                            self.status = Some("Enter your current password.");
+                            cx.notify();
+                            return;
+                        }
+                        (
+                            Request::ManageTwoFactor,
+                            Operation::ManageTwoFactor {
+                                session: session.token.clone(),
+                                password,
+                                code,
+                                action: *action,
+                            },
+                        )
+                    }
                     _ => return,
                 }
             }
@@ -68,19 +85,53 @@ impl AuthView {
                 self.busy,
             )
         };
+        let password = || {
+            field(
+                &self.current_password,
+                "Current password",
+                InputContentType::Password,
+                PASSWORD_ICON,
+                self.busy,
+            )
+        };
         let (title, hint, label, body) = match &self.screen {
             Screen::FactorSettings(_) => (
                 "Two-factor authentication",
                 "Confirm your password to start setup.",
                 "Set up authenticator",
-                div().child(field(
-                    &self.current_password,
-                    "Current password",
-                    InputContentType::Password,
-                    PASSWORD_ICON,
-                    self.busy,
-                )),
+                div().child(password()),
             ),
+            Screen::FactorOverview(_, count) => (
+                "Two-factor authentication",
+                "Authenticator is enabled.",
+                "Replace backup codes",
+                div()
+                    .text_center()
+                    .child(format!("Backup codes remaining: {count}")),
+            ),
+            Screen::FactorManage(_, action) => {
+                let (title, hint) = match action {
+                    TwoFactorAction::Disable => (
+                        "Disable 2FA",
+                        "Confirm your password and a security code to disable 2FA.",
+                    ),
+                    TwoFactorAction::ReplaceBackupCodes => (
+                        "Replace backup codes",
+                        "Confirm your password and a security code. Old backup codes will expire.",
+                    ),
+                };
+                (
+                    title,
+                    hint,
+                    title,
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .child(password())
+                        .child(input()),
+                )
+            }
             Screen::FactorSetup(_, secret) => (
                 "Connect authenticator",
                 "Add a time-based account in your authenticator and enter this key.",
@@ -135,18 +186,46 @@ impl AuthView {
             .gap(px(12.))
             .child(
                 link("two-factor-action", label, self.busy).on_click(cx.listener(
-                    |view, _, window, cx| {
-                        if let Screen::FactorBackupCodes(_, codes) = &view.screen {
+                    |view, _, window, cx| match &view.screen {
+                        Screen::FactorBackupCodes(_, codes) => {
                             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
                                 codes.join("\n"),
                             ));
                             view.status = Some("Backup codes copied.");
                             cx.notify();
-                        } else {
-                            view.submit(window, cx);
                         }
+                        Screen::FactorOverview(session, _) => view.switch(
+                            Screen::FactorManage(
+                                session.clone(),
+                                TwoFactorAction::ReplaceBackupCodes,
+                            ),
+                            window,
+                            cx,
+                        ),
+                        _ => view.submit(window, cx),
                     },
                 )),
+            )
+            .when(
+                matches!(self.screen, Screen::FactorOverview(..)),
+                |footer| {
+                    footer.child(
+                        link("two-factor-disable", "Disable 2FA", self.busy).on_click(cx.listener(
+                            |view, _, window, cx| {
+                                if let Screen::FactorOverview(session, _) = &view.screen {
+                                    view.switch(
+                                        Screen::FactorManage(
+                                            session.clone(),
+                                            TwoFactorAction::Disable,
+                                        ),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        )),
+                    )
+                },
             )
             .child(
                 link(
@@ -162,7 +241,10 @@ impl AuthView {
                     let screen = match &view.screen {
                         Screen::FactorSignIn(_) => Screen::SignIn,
                         Screen::FactorSetup(session, _) => Screen::FactorSettings(session.clone()),
-                        Screen::FactorSettings(session) | Screen::FactorBackupCodes(session, _) => {
+                        Screen::FactorSettings(session)
+                        | Screen::FactorBackupCodes(session, _)
+                        | Screen::FactorOverview(session, _)
+                        | Screen::FactorManage(session, _) => {
                             Screen::AccountSettings(session.clone())
                         }
                         _ => return,

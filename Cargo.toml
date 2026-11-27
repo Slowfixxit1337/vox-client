@@ -14,7 +14,7 @@ desktop = ["dep:gpui-kit", "dep:async-channel", "dep:image", "dep:raw-window-han
 webrtc = ["dep:libwebrtc"]
 
 [dependencies]
-vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "81e12501ffe9e339f306dde2d189ff10a317ad1e" }
+vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "2875bfa1e671041be4becac85f7606072617f2c7" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
