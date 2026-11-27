@@ -16,6 +16,7 @@ use std::{
 use tokio::runtime::Handle;
 use vox_protocol::auth::{AuthError, Operation, Outcome, TwoFactorAction};
 
+mod devices;
 mod two_factor;
 const BACKGROUND: u32 = 0x020617;
 const FIELD: u32 = 0x0f172a;
@@ -104,6 +105,7 @@ enum Screen {
     Confirmation(Verification),
     Friends(Session),
     AccountSettings(Session),
+    Devices(Session, devices::DevicePanel),
     FactorSettings(Session),
     FactorOverview(Session, u32),
     FactorManage(Session, TwoFactorAction),
@@ -143,6 +145,7 @@ struct AuthView {
     current_password: Entity<InputState>,
     confirm_password: Entity<InputState>,
     factor_code: Entity<InputState>,
+    device_fingerprint: Entity<InputState>,
     reset_email: Entity<InputState>,
     reset_link: Entity<InputState>,
     otp: Entity<OtpState>,
@@ -182,6 +185,8 @@ impl AuthView {
                 .placeholder("Authenticator or backup code")
                 .masked(true)
         });
+        let device_fingerprint = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Fingerprint from the other device"));
         let otp = cx.new(|cx| OtpState::new(6, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&password, window, |view, _, event, window, cx| {
@@ -251,6 +256,7 @@ impl AuthView {
             current_password,
             confirm_password,
             factor_code,
+            device_fingerprint,
             reset_email,
             reset_link,
             otp,
@@ -295,6 +301,8 @@ impl AuthView {
             .update(cx, |password, cx| password.set_value("", window, cx));
         self.factor_code
             .update(cx, |code, cx| code.set_value("", window, cx));
+        self.device_fingerprint
+            .update(cx, |value, cx| value.set_value("", window, cx));
         self.reset_link
             .update(cx, |link, cx| link.set_value("", window, cx));
         self.focus(window, cx);
@@ -559,7 +567,10 @@ impl AuthView {
             | Screen::FactorSetup(..)
             | Screen::FactorSignIn(_)
             | Screen::FactorManage(..) => self.submit_two_factor(window, cx),
-            Screen::Friends(_) | Screen::FactorBackupCodes(..) | Screen::FactorOverview(..) => {}
+            Screen::Friends(_)
+            | Screen::FactorBackupCodes(..)
+            | Screen::FactorOverview(..)
+            | Screen::Devices(..) => {}
         }
     }
 
@@ -769,6 +780,12 @@ impl AuthView {
                     username, session, ..
                 },
             ) => {
+                let account = self.client.clone();
+                let device_user = username.clone();
+                let device_session = session.clone();
+                self.runtime.spawn(async move {
+                    let _ = account.register_device(&device_user, &device_session).await;
+                });
                 self.switch(
                     Screen::Friends(Session {
                         username,
@@ -1242,6 +1259,20 @@ impl AuthView {
                 ),
             )
             .child(
+                link("account-devices", "Devices", self.busy).on_click(cx.listener(
+                    |view, _, window, cx| {
+                        if let Screen::AccountSettings(session) = &view.screen {
+                            view.switch(
+                                Screen::Devices(session.clone(), devices::DevicePanel::default()),
+                                window,
+                                cx,
+                            );
+                            view.load_devices(devices::DeviceAction::Refresh, window, cx);
+                        }
+                    },
+                )),
+            )
+            .child(
                 link("account-settings-back", "Back to Friends", self.busy).on_click(cx.listener(
                     |view, _, window, cx| {
                         if let Screen::AccountSettings(session) = &view.screen {
@@ -1333,6 +1364,7 @@ impl Render for AuthView {
             Screen::Confirmation(verification) => self.confirmation(verification, window, cx),
             Screen::Friends(session) => self.friends(session, cx),
             Screen::AccountSettings(session) => self.account_settings(session, cx),
+            Screen::Devices(_, panel) => self.device_panel(panel, cx),
             Screen::FactorSettings(_)
             | Screen::FactorOverview(..)
             | Screen::FactorManage(..)
@@ -1416,5 +1448,8 @@ fn error_text(code: AuthError) -> &'static str {
         AuthError::SessionExpired => "Your session expired. Sign in again.",
         AuthError::Unavailable => "The account service is unavailable. Try again.",
         AuthError::TwoFactorAlreadyEnabled => "Two-factor authentication is already enabled.",
+        AuthError::DeviceKeyConflict => "This device key conflicts with the account directory.",
+        AuthError::DeviceRevoked => "This device was revoked.",
+        AuthError::DeviceLimit => "This account has reached its device limit.",
     }
 }

@@ -7122,6 +7122,7 @@ dependencies = [
  "libwebrtc",
  "rand 0.10.4",
  "raw-window-handle",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -7134,12 +7135,13 @@ dependencies = [
  "vox-protocol",
  "windows 0.62.2",
  "windows-core 0.62.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "vox-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=2875bfa1e671041be4becac85f7606072617f2c7#2875bfa1e671041be4becac85f7606072617f2c7"
+source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=1d38223ca4a2e28ff42861e3d763e1566dcbe82b#1d38223ca4a2e28ff42861e3d763e1566dcbe82b"
 dependencies = [
  "postcard",
  "serde",

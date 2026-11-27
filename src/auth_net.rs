@@ -24,6 +24,9 @@ use windows::{
     core::PCWSTR,
 };
 
+mod devices;
+pub use devices::{DeviceSnapshot, TrustState};
+
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_FILE_LIMIT: usize = 16 * 1024;
 
@@ -350,6 +353,9 @@ mod tests {
             anyhow::bail!("confirmation did not create a session");
         };
         assert_eq!(confirmed, username);
+        let directory = client.device_catalog(&username, &session).await?;
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.entries[0].state, TrustState::Local);
         client.remember_session(&session)?;
         assert_eq!(client.saved_session()?, Some(session.clone()));
         assert!(matches!(

@@ -14,11 +14,13 @@ desktop = ["dep:gpui-kit", "dep:async-channel", "dep:image", "dep:raw-window-han
 webrtc = ["dep:libwebrtc"]
 
 [dependencies]
-vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "2875bfa1e671041be4becac85f7606072617f2c7" }
+vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "1d38223ca4a2e28ff42861e3d763e1566dcbe82b" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
 hex = "0.4"
+ring = "0.17"
+zeroize = "1"
 sha2 = "0.10"
 rand = "0.10"
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
