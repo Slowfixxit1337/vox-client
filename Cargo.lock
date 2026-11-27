@@ -7113,9 +7113,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "data-encoding",
  "futures-util",
  "gpui-kit",
  "hex",
+ "hmac",
  "image",
  "libwebrtc",
  "rand 0.10.4",
@@ -7123,6 +7125,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -7136,7 +7139,7 @@ dependencies = [
 [[package]]
 name = "vox-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=e9fcdce9fb6d76777b4a3fe6c71a957e12f7e05d#e9fcdce9fb6d76777b4a3fe6c71a957e12f7e05d"
+source = "git+https://github.com/Slowfixxit1337/vox-protocol.git?rev=81e12501ffe9e339f306dde2d189ff10a317ad1e#81e12501ffe9e339f306dde2d189ff10a317ad1e"
 dependencies = [
  "postcard",
  "serde",

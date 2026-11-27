@@ -344,6 +344,15 @@ async fn join(
 }
 
 async fn open(url: String, tls: Option<Connector>, capabilities: u64) -> Result<Socket> {
+    open_with_optional(url, tls, capabilities, 0).await
+}
+
+async fn open_with_optional(
+    url: String,
+    tls: Option<Connector>,
+    required: u64,
+    optional: u64,
+) -> Result<Socket> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
@@ -352,12 +361,12 @@ async fn open(url: String, tls: Option<Connector>, capabilities: u64) -> Result<
     let hello = ClientHello {
         min_minor: MINOR,
         max_minor: MINOR,
-        capabilities,
-        required: capabilities,
+        capabilities: required | optional,
+        required,
     };
     let reply: ServerHello = exchange(&mut socket, 1, &hello).await?;
     anyhow::ensure!(
-        reply.minor == MINOR && reply.capabilities & capabilities == capabilities,
+        reply.minor == MINOR && reply.capabilities & required == required,
         "server did not negotiate required capabilities"
     );
     Ok(socket)

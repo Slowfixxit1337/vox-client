@@ -14,7 +14,7 @@ desktop = ["dep:gpui-kit", "dep:async-channel", "dep:image", "dep:raw-window-han
 webrtc = ["dep:libwebrtc"]
 
 [dependencies]
-vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "e9fcdce9fb6d76777b4a3fe6c71a957e12f7e05d" }
+vox-protocol = { git = "https://github.com/Slowfixxit1337/vox-protocol.git", rev = "81e12501ffe9e339f306dde2d189ff10a317ad1e" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
@@ -29,6 +29,9 @@ rustls-pemfile = "2"
 
 [dev-dependencies]
 tempfile = "3"
+data-encoding = "2"
+hmac = "0.12"
+sha1 = "0.10"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "=0.62.2", features = ["Win32_System_WinRT_Graphics_Capture", "Win32_UI_WindowsAndMessaging"] }

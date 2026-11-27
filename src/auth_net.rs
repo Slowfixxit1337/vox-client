@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::Connector;
 use vox_client::DevAddress;
 use vox_protocol::{
-    CAP_AUTH, CAP_FRAME_E2EE,
+    CAP_AUTH, CAP_FRAME_E2EE, CAP_TWO_FACTOR,
     auth::{AuthReply, AuthRequest, Operation, Outcome},
 };
 use windows::{
@@ -83,10 +83,11 @@ impl Client {
     pub async fn call(&self, operation: Operation) -> Result<Outcome> {
         timeout(AUTH_TIMEOUT, async {
             let capabilities = CAP_FRAME_E2EE | CAP_AUTH | operation.required_capability();
-            let mut socket = super::open(
+            let mut socket = super::open_with_optional(
                 format!("wss://{}/v1/auth", self.address.authority()),
                 self.tls.clone(),
                 capabilities,
+                CAP_TWO_FACTOR,
             )
             .await?;
             let result: AuthReply =
@@ -467,10 +468,63 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            client.call(sign_in(changed)).await?,
-            Outcome::Authenticated { .. }
-        ));
+        let Outcome::Authenticated { session, .. } = client.call(sign_in(changed)).await? else {
+            anyhow::bail!("changed password did not work over WSS");
+        };
+        let Outcome::TwoFactorSetup { secret, .. } = client
+            .call(Operation::BeginTwoFactor {
+                session: session.clone(),
+                password: changed.into(),
+            })
+            .await?
+        else {
+            anyhow::bail!("authenticator setup did not start");
+        };
+        let code = authenticator_code(&secret)?;
+        let Outcome::TwoFactorEnabled { backup_codes } = client
+            .call(Operation::ConfirmTwoFactor { session, code })
+            .await?
+        else {
+            anyhow::bail!("authenticator enrollment failed");
+        };
+        ensure!(backup_codes.len() == 8, "expected eight recovery codes");
+        for expected_success in [true, false] {
+            let Outcome::TwoFactorRequired { challenge, .. } =
+                client.call(sign_in(changed)).await?
+            else {
+                anyhow::bail!("password-only sign-in was not challenged");
+            };
+            let result = client
+                .call(Operation::CompleteTwoFactorSignIn {
+                    challenge,
+                    code: backup_codes[0].clone(),
+                })
+                .await?;
+            if expected_success {
+                assert!(matches!(result, Outcome::Authenticated { .. }));
+            } else {
+                assert!(matches!(
+                    result,
+                    Outcome::Rejected {
+                        code: AuthError::InvalidCode,
+                        ..
+                    }
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn authenticator_code(secret: &str) -> Result<String> {
+        use hmac::{Hmac, Mac};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let key = data_encoding::BASE32_NOPAD.decode(secret.as_bytes())?;
+        let step = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 30;
+        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key)?;
+        mac.update(&step.to_be_bytes());
+        let digest = mac.finalize().into_bytes();
+        let offset = usize::from(digest[19] & 0x0f);
+        let number = u32::from_be_bytes(digest[offset..offset + 4].try_into()?) & 0x7fff_ffff;
+        Ok(format!("{:06}", number % 1_000_000))
     }
 }

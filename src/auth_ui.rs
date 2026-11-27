@@ -16,6 +16,7 @@ use std::{
 use tokio::runtime::Handle;
 use vox_protocol::auth::{AuthError, Operation, Outcome};
 
+mod two_factor;
 const BACKGROUND: u32 = 0x020617;
 const FIELD: u32 = 0x0f172a;
 const BORDER: u32 = 0x1e293b;
@@ -103,6 +104,10 @@ enum Screen {
     Confirmation(Verification),
     Friends(Session),
     AccountSettings(Session),
+    FactorSettings(Session),
+    FactorSetup(Session, String),
+    FactorBackupCodes(Session, Vec<String>),
+    FactorSignIn(String),
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +117,9 @@ enum Request {
     SendResetLink,
     ResetPassword,
     ChangePassword,
+    BeginTwoFactor,
+    ConfirmTwoFactor,
+    CompleteTwoFactor,
     Confirm,
     Resend,
     Resume,
@@ -130,6 +138,7 @@ struct AuthView {
     password: Entity<InputState>,
     current_password: Entity<InputState>,
     confirm_password: Entity<InputState>,
+    factor_code: Entity<InputState>,
     reset_email: Entity<InputState>,
     reset_link: Entity<InputState>,
     otp: Entity<OtpState>,
@@ -164,6 +173,11 @@ impl AuthView {
                 .placeholder("Confirm new password")
                 .masked(true)
         });
+        let factor_code = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Authenticator or backup code")
+                .masked(true)
+        });
         let otp = cx.new(|cx| OtpState::new(6, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&password, window, |view, _, event, window, cx| {
@@ -174,6 +188,11 @@ impl AuthView {
                 }
             }),
             cx.subscribe_in(&confirm_password, window, |view, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    view.submit(window, cx);
+                }
+            }),
+            cx.subscribe_in(&factor_code, window, |view, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     view.submit(window, cx);
                 }
@@ -227,6 +246,7 @@ impl AuthView {
             password,
             current_password,
             confirm_password,
+            factor_code,
             reset_email,
             reset_link,
             otp,
@@ -240,11 +260,14 @@ impl AuthView {
         match &self.screen {
             Screen::SignIn => self.login.read(cx).focus_handle(cx).focus(window, cx),
             Screen::Registration => self.username.read(cx).focus_handle(cx).focus(window, cx),
-            Screen::AccountSettings(_) => self
+            Screen::AccountSettings(_) | Screen::FactorSettings(_) => self
                 .current_password
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx),
+            Screen::FactorSetup(..) | Screen::FactorSignIn(_) => {
+                self.factor_code.read(cx).focus_handle(cx).focus(window, cx)
+            }
             Screen::RequestPasswordReset => {
                 self.reset_email.read(cx).focus_handle(cx).focus(window, cx)
             }
@@ -265,6 +288,8 @@ impl AuthView {
             .update(cx, |password, cx| password.set_value("", window, cx));
         self.confirm_password
             .update(cx, |password, cx| password.set_value("", window, cx));
+        self.factor_code
+            .update(cx, |code, cx| code.set_value("", window, cx));
         self.reset_link
             .update(cx, |link, cx| link.set_value("", window, cx));
         self.focus(window, cx);
@@ -347,9 +372,10 @@ impl AuthView {
         self.run(request, window, cx, move |client| async move {
             let outcome = client.call(operation).await?;
             match (&request, &outcome) {
-                (Request::SignIn, Outcome::Authenticated { session, .. }) => {
-                    client.remember_session(session)?
-                }
+                (
+                    Request::SignIn | Request::CompleteTwoFactor,
+                    Outcome::Authenticated { session, .. },
+                ) => client.remember_session(session)?,
                 (
                     Request::SignOut,
                     Outcome::SignedOut
@@ -359,7 +385,7 @@ impl AuthView {
                     },
                 ) => client.clear_session()?,
                 (
-                    Request::ChangePassword,
+                    Request::ChangePassword | Request::BeginTwoFactor | Request::ConfirmTwoFactor,
                     Outcome::Rejected {
                         code: AuthError::SessionExpired,
                         ..
@@ -520,7 +546,10 @@ impl AuthView {
                     cx,
                 );
             }
-            Screen::Friends(_) => {}
+            Screen::FactorSettings(_) | Screen::FactorSetup(..) | Screen::FactorSignIn(_) => {
+                self.submit_two_factor(window, cx)
+            }
+            Screen::Friends(_) | Screen::FactorBackupCodes(..) => {}
         }
     }
 
@@ -570,6 +599,43 @@ impl AuthView {
         cx: &mut Context<Self>,
     ) {
         match (request, outcome) {
+            (Request::SignIn, Outcome::TwoFactorRequired { challenge, .. }) => {
+                self.switch(Screen::FactorSignIn(challenge), window, cx);
+            }
+            (Request::BeginTwoFactor, Outcome::TwoFactorSetup { secret, .. }) => {
+                if let Screen::FactorSettings(session) = &self.screen {
+                    self.switch(Screen::FactorSetup(session.clone(), secret), window, cx);
+                }
+            }
+            (Request::ConfirmTwoFactor, Outcome::TwoFactorEnabled { backup_codes }) => {
+                if let Screen::FactorSetup(session, _) = &self.screen {
+                    self.switch(
+                        Screen::FactorBackupCodes(session.clone(), backup_codes),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            (
+                Request::BeginTwoFactor | Request::ConfirmTwoFactor,
+                Outcome::Rejected {
+                    code: AuthError::SessionExpired,
+                    ..
+                },
+            ) => {
+                self.switch(Screen::SignIn, window, cx);
+                self.status = Some(error_text(AuthError::SessionExpired));
+            }
+            (
+                Request::CompleteTwoFactor,
+                Outcome::Rejected {
+                    code: AuthError::ExpiredCode,
+                    ..
+                },
+            ) => {
+                self.switch(Screen::SignIn, window, cx);
+                self.status = Some("The sign-in challenge expired. Enter your password again.");
+            }
             (Request::ChangePassword, Outcome::PasswordChanged) => {
                 if let Screen::AccountSettings(session) = &self.screen {
                     self.switch(Screen::Friends(session.clone()), window, cx);
@@ -654,7 +720,7 @@ impl AuthView {
                 }
             }
             (
-                Request::SignIn | Request::Resume | Request::Remember,
+                Request::SignIn | Request::Resume | Request::Remember | Request::CompleteTwoFactor,
                 Outcome::Authenticated {
                     username, session, ..
                 },
@@ -1116,6 +1182,15 @@ impl AuthView {
                     .on_click(cx.listener(|view, _, window, cx| view.submit(window, cx))),
             )
             .child(
+                link("open-two-factor", "Two-factor authentication", self.busy).on_click(
+                    cx.listener(|view, _, window, cx| {
+                        if let Screen::AccountSettings(session) = &view.screen {
+                            view.switch(Screen::FactorSettings(session.clone()), window, cx);
+                        }
+                    }),
+                ),
+            )
+            .child(
                 link("account-settings-back", "Back to Friends", self.busy).on_click(cx.listener(
                     |view, _, window, cx| {
                         if let Screen::AccountSettings(session) = &view.screen {
@@ -1207,6 +1282,10 @@ impl Render for AuthView {
             Screen::Confirmation(verification) => self.confirmation(verification, window, cx),
             Screen::Friends(session) => self.friends(session, cx),
             Screen::AccountSettings(session) => self.account_settings(session, cx),
+            Screen::FactorSettings(_)
+            | Screen::FactorSetup(..)
+            | Screen::FactorBackupCodes(..)
+            | Screen::FactorSignIn(_) => self.render_two_factor(cx),
         }
     }
 }
@@ -1283,5 +1362,6 @@ fn error_text(code: AuthError) -> &'static str {
         AuthError::RateLimited => "Too many attempts. Wait before trying again.",
         AuthError::SessionExpired => "Your session expired. Sign in again.",
         AuthError::Unavailable => "The account service is unavailable. Try again.",
+        AuthError::TwoFactorAlreadyEnabled => "Two-factor authentication is already enabled.",
     }
 }
