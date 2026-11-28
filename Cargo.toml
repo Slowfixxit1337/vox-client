@@ -35,6 +35,10 @@ data-encoding = "2"
 hmac = "0.12"
 sha1 = "0.10"
 
+[build-dependencies]
+embed-resource = "3.0.12"
+resvg = { version = "0.46", default-features = false }
+
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "=0.62.2", features = ["Win32_System_WinRT_Graphics_Capture", "Win32_UI_WindowsAndMessaging"] }
 
